@@ -8,7 +8,7 @@
 #include "json_mini.hpp"
 #include "presto/log.hpp"
 
-#include "mlx/core.h"
+#include "mlx.h"
 
 #include <algorithm>
 #include <chrono>
