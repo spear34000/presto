@@ -1,33 +1,97 @@
 #!/usr/bin/env bash
 # presto - MLX smoke test for macOS Apple Silicon CI
-# Converts a tiny public HF model to MLX layout, then performs REAL token
-# generation through the presto MLX backend.
+#
+# Stage A (preferred): download a real published non-quantized MLX model
+#                      (mlx-community/SmolLM-135M-fp16, llama architecture)
+#                      and generate tokens through the presto MLX backend.
+# Stage B (fallback) : synthesize a small deterministic MLX-layout directory
+#                      (same layout unquantized mlx-lm produces) so a hub
+#                      outage cannot mask backend regressions.
 set -uo pipefail
 
-HF_MODEL="${1:-hf-internal-testing/tiny-random-LlamaForCausalLM}"
-OUT_DIR="${2:-./tiny_mlx}"
-MAX_TOKENS="${3:-8}"
+REAL_MODEL="mlx-community/SmolLM-135M-fp16"
+FALLBACK_DIR="${1:-./tiny_mlx_synth}"
+MAX_TOKENS="${2:-8}"
 BIN="${PRESTO_BIN:-./build/presto}"
 
 echo "::group::[smoke-mlx] environment"
 uname -a
 python3 --version
-python3 -m pip install --quiet --upgrade mlx-lm huggingface_hub || exit 1
-python3 -c "import mlx.core as mx; print('mlx', mx.__version__ if hasattr(mx,'__version__') else 'ok')"
+python3 -m pip install --quiet --upgrade huggingface_hub numpy safetensors || exit 1
 echo "::endgroup::"
 
-echo "::group::[smoke-mlx] convert $HF_MODEL -> $OUT_DIR"
-rm -rf "$OUT_DIR"
-if ! python3 -m mlx_lm convert --hf-path "$HF_MODEL" --mlx-path "$OUT_DIR"; then
-    echo "[smoke-mlx] python module form failed; trying API form"
-    python3 -c "
-from mlx_lm import convert
-convert('$HF_MODEL', '$OUT_DIR')
-print('converted ok')
-" || { echo "::endgroup::"; echo "[smoke-mlx] FAILED: conversion"; exit 1; }
+MODEL_DIR=""
+
+echo "::group::[smoke-mlx] stage A: real model $REAL_MODEL"
+if python3 - <<'PY'
+from huggingface_hub import snapshot_download
+p = snapshot_download(
+    "mlx-community/SmolLM-135M-fp16",
+    allow_patterns=["*.json", "*.safetensors"],
+)
+print("downloaded to", p)
+PY
+then
+    MODEL_DIR=$(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download('mlx-community/SmolLM-135M-fp16', local_files_only=True))")
+    echo "[smoke-mlx] stage A model dir: $MODEL_DIR"
+else
+    echo "[smoke-mlx] stage A download failed; will use fallback"
 fi
-ls -la "$OUT_DIR"
-cat "$OUT_DIR/config.json" || true
+echo "::endgroup::"
+
+if [ -z "$MODEL_DIR" ]; then
+    echo "::group::[smoke-mlx] stage B: synthetic MLX-layout fixture"
+    if ! python3 - "$FALLBACK_DIR" <<'PY'
+import json, sys, os
+import numpy as np
+from safetensors.numpy import save_file
+
+out = sys.argv[1]
+os.makedirs(out, exist_ok=True)
+H, L, NH, NKV, FF, V = 32, 2, 4, 2, 96, 128
+DH = H // NH
+rng = np.random.default_rng(42)
+t = {"model.embed_tokens.weight": rng.standard_normal((V, H)).astype(np.float32)}
+for l in range(L):
+    p = f"model.layers.{l}."
+    t[p + "input_layernorm.weight"] = np.ones(H, np.float32)
+    t[p + "post_attention_layernorm.weight"] = np.ones(H, np.float32)
+    t[p + "self_attn.q_proj.weight"] = rng.standard_normal((NH * DH, H)).astype(np.float32)
+    t[p + "self_attn.k_proj.weight"] = rng.standard_normal((NKV * DH, H)).astype(np.float32)
+    t[p + "self_attn.v_proj.weight"] = rng.standard_normal((NKV * DH, H)).astype(np.float32)
+    t[p + "self_attn.o_proj.weight"] = rng.standard_normal((H, NH * DH)).astype(np.float32)
+    t[p + "mlp.gate_proj.weight"] = rng.standard_normal((FF, H)).astype(np.float32)
+    t[p + "mlp.up_proj.weight"] = rng.standard_normal((FF, H)).astype(np.float32)
+    t[p + "mlp.down_proj.weight"] = rng.standard_normal((H, FF)).astype(np.float32)
+t["model.norm.weight"] = np.ones(H, np.float32)
+t["lm_head.weight"] = rng.standard_normal((V, H)).astype(np.float32)
+save_file(t, os.path.join(out, "model.safetensors"))
+cfg = {
+    "model_type": "llama",
+    "hidden_size": H,
+    "num_hidden_layers": L,
+    "num_attention_heads": NH,
+    "num_key_value_heads": NKV,
+    "intermediate_size": FF,
+    "vocab_size": V,
+    "rms_norm_eps": 1e-5,
+    "rope_theta": 10000.0,
+}
+with open(os.path.join(out, "config.json"), "w") as f:
+    json.dump(cfg, f)
+print("fixture written to", out)
+PY
+    then
+        echo "::endgroup::"
+        echo "[smoke-mlx] FAILED: could not prepare any model"
+        exit 1
+    fi
+    MODEL_DIR="$FALLBACK_DIR"
+    STAGE="B-synthetic-fixture"
+else
+    STAGE="A-real-model($REAL_MODEL)"
+fi
+echo "[smoke-mlx] testing stage=$STAGE dir=$MODEL_DIR"
 echo "::endgroup::"
 
 echo "::group::[smoke-mlx] locate binary"
@@ -39,21 +103,22 @@ if [ -z "${BIN}" ] || [ ! -x "$BIN" ]; then
     echo "[smoke-mlx] FAILED: presto binary not found"
     exit 1
 fi
-"$BIN" info "$OUT_DIR" || true
+"$BIN" version || true
+"$BIN" info "$MODEL_DIR" || true
 echo "::endgroup::"
 
-echo "::group::[smoke-mlx] generate $MAX_TOKENS tokens (token-id level)"
+echo "::group::[smoke-mlx] generate $MAX_TOKENS tokens via MLX backend ($STAGE)"
 set +e
-PRESTO_SMOKE=1 "$BIN" run "$OUT_DIR" --prompt-tokens "1,2,3" --max-tokens "$MAX_TOKENS" 2>&1 |
+PRESTO_SMOKE=1 "$BIN" run "$MODEL_DIR" --prompt-tokens "1,2,3" --max-tokens "$MAX_TOKENS" 2>&1 |
     tee smoke-mlx.log
 STATUS=${PIPESTATUS[0]}
 set -e
 echo "::endgroup::"
 
 if ! grep -q '\[presto-smoke\].*ok=true' smoke-mlx.log; then
-    echo "[smoke-mlx] FAILED: success marker missing"
+    echo "[smoke-mlx] FAILED: success marker missing (stage=$STAGE)"
     tail -50 smoke-mlx.log || true
     exit 1
 fi
-echo "[smoke-mlx] SUCCESS"
+echo "[smoke-mlx] SUCCESS stage=$STAGE"
 exit "$STATUS"

@@ -46,7 +46,9 @@ jobs:
           cmake --build build --config Release --parallel 2>&1 | tee logs/02-build.log
 
       - name: Unit tests
-        run: ./build/presto_tests 2>&1 | tee logs/03-tests.log
+        run: |
+          set -o pipefail
+          ./build/presto_tests 2>&1 | tee logs/03-tests.log
 
       - name: Upload failure logs
         if: failure()
@@ -142,13 +144,20 @@ jobs:
           cmake --build build --config Release --parallel 3 2>&1 | tee logs/02-build.log
 
       - name: Unit tests
-        run: ./build/presto_tests 2>&1 | tee logs/03-tests.log
+        run: |
+          set -o pipefail
+          ./build/presto_tests 2>&1 | tee logs/03-tests.log
 
+      # pipefail guards against `| tee` masking smoke-script exit codes
       - name: Smoke - MLX real token generation
-        run: bash scripts/smoke_mlx.sh 2>&1 | tee logs/04-smoke-mlx.log
+        run: |
+          set -o pipefail
+          bash scripts/smoke_mlx.sh 2>&1 | tee logs/04-smoke-mlx.log
 
       - name: Smoke - GGUF via Metal
-        run: bash scripts/smoke_gguf.sh 2>&1 | tee logs/04-smoke-gguf.log
+        run: |
+          set -o pipefail
+          bash scripts/smoke_gguf.sh 2>&1 | tee logs/04-smoke-gguf.log
 
       - name: Upload failure logs
         if: failure()
