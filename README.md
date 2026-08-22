@@ -89,7 +89,7 @@ GitHub Actions runs three jobs on every push:
 |-----|--------|----------|
 | `ubuntu-core` | ubuntu-latest | core-only build + unit tests (fast gate) |
 | `windows-gguf` | windows-latest | MSVC + llama.cpp static link + **real GGUF token generation** |
-| `macos-mlx` | macos-14 (arm64) | clang + MLX link + **real MLX token generation** + Metal GGUF |
+| `macos-mlx` | macos-15 (arm64) | clang + MLX v0.32.1 link + **real MLX token generation** + Metal GGUF |
 
 Failures always upload a `logs-*` artifact containing configure/build/test/smoke logs
 and environment info; smoke scripts print `[presto-smoke]` markers so a single log

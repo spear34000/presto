@@ -19,6 +19,7 @@ option(PRESTO_BUILD_TESTS "Build zero-dependency unit tests" ON)
 # Dependency refs. llama.cpp is pinned to a commit verified by the local
 # build; bump deliberately when updating.
 set(PRESTO_LLAMA_TAG "b21e4de74567f5eef213765c9476a843c2e43f0d" CACHE STRING "llama.cpp git ref")
+set(PRESTO_MLX_TAG "v0.32.1" CACHE STRING "mlx git ref")
 set(PRESTO_HTTPLIB_TAG "v0.15.3" CACHE STRING "cpp-httplib git ref")
 
 include(FetchContent)
@@ -92,7 +93,7 @@ endif()
 if(_presto_mlx_enabled)
   FetchContent_Declare(mlx
       GIT_REPOSITORY https://github.com/ml-explore/mlx
-      GIT_TAG main
+      GIT_TAG ${PRESTO_MLX_TAG}
       GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(mlx)
   target_compile_definitions(presto PRIVATE PRESTO_WITH_MLX=1)
