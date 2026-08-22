@@ -21,6 +21,7 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
   std::string dir_;
+  double load_sec_ = 0.0;
 };
 
 std::unique_ptr<IBackend> make_mlx_backend(const std::string& path);

@@ -8,8 +8,7 @@
 #include "json_mini.hpp"
 #include "presto/log.hpp"
 
-#include "mlx/array.h"
-#include "mlx/ops.h"
+#include "mlx/core.h"
 
 #include <algorithm>
 #include <chrono>
@@ -310,7 +309,9 @@ bool MlxBackend::load(std::string& err) {
 namespace {
 
 mx::array make_f32_array(const TensorData& t) {
-  return mx::array(t.data.data(), t.shape);
+  // mlx's Shape is a SmallVector<int32_t>; convert our std::vector<int> explicitly
+  const mx::Shape shp(t.shape.begin(), t.shape.end());
+  return mx::array(t.data.data(), shp);
 }
 
 // x[T,H]: (x * w[H]) / sqrt(mean(x^2)+eps)
@@ -392,7 +393,8 @@ bool MlxBackend::generate(const GenerateParams& gp, GenerateResult& r, std::stri
         auto sl = [&](int s, int e) {
           return mx::slice(x3, {0, 0, s}, {T, heads, e}, {1, 1, 1});
         };
-        const mx::array rot = mx::concat({mx::negative(sl(dh / 2, dh)), sl(0, dh / 2)}, -1);
+        const mx::array rot =
+            mx::concatenate({mx::negative(sl(dh / 2, dh)), sl(0, dh / 2)}, -1);
         return mx::add(mx::multiply(x3, costab_h), mx::multiply(rot, sintab_h));
       };
 
@@ -427,7 +429,8 @@ bool MlxBackend::generate(const GenerateParams& gp, GenerateResult& r, std::stri
         const mx::array u = mx::matmul(h, W("mlp.up_proj.weight"));
         const mx::array sig =
             mx::divide(mx::array(1.0), mx::add(mx::array(1.0), mx::exp(mx::negative(g))));
-        const mx::array mlp = mx::matmul(mx::multiply(g, sig), u, W("mlp.down_proj.weight"));
+        const mx::array gated = mx::multiply(mx::multiply(g, sig), u);
+        const mx::array mlp = mx::matmul(gated, W("mlp.down_proj.weight"));
         x = mx::add(x, mlp);
       }
 
