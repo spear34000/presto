@@ -1,0 +1,26 @@
+# build artifacts
+build*/
+cmake-build-*/
+out/
+_deps/
+smoke-gguf.log
+smoke-mlx.log
+logs/
+
+# model weights / generated model dirs
+*.gguf
+*.safetensors
+*.pth
+*.ckpt
+tiny_mlx/
+models/
+hf-cache/
+
+# python helpers used in CI only
+__pycache__/
+*.pyc
+
+# tooling
+.codegraph/
+.omo/
+.DS_Store

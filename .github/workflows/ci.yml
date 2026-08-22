@@ -1,0 +1,161 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: fast gate - core parsers + unit tests, no heavy backends
+  # ---------------------------------------------------------------------------
+  ubuntu-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record environment
+        run: |
+          mkdir -p logs
+          {
+            echo "uname: $(uname -a)"
+            echo "cmake: $(cmake --version | head -n1)"
+            echo "cxx:   $(g++ --version | head -n1)"
+          } | tee logs/env.txt
+          {
+            echo "## ubuntu-core"
+            echo '```'
+            cat logs/env.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure (core only, no network-heavy deps)
+        run: |
+          set -o pipefail
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DPRESTO_WITH_LLAMACPP=OFF 2>&1 | tee logs/01-configure.log
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cmake --build build --config Release --parallel 2>&1 | tee logs/02-build.log
+
+      - name: Unit tests
+        run: ./build/presto_tests 2>&1 | tee logs/03-tests.log
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-ubuntu-core
+          path: logs/
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Windows - MSVC + llama.cpp backend + REAL GGUF token generation
+  # ---------------------------------------------------------------------------
+  windows-gguf:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record environment
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          (cmake --version | Select-Object -First 1) | Tee-Object -FilePath logs/env.txt
+
+      - name: Configure (llama.cpp pinned static)
+        shell: pwsh
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release 2>&1 | Tee-Object -FilePath logs/01-configure.log
+          exit $LASTEXITCODE
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath logs/02-build.log
+          exit $LASTEXITCODE
+
+      - name: Unit tests
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse build -Filter presto_tests.exe | Select-Object -First 1
+          & $exe.FullName 2>&1 | Tee-Object -FilePath logs/03-tests.log
+          exit $LASTEXITCODE
+
+      - name: Smoke - real GGUF generation
+        shell: pwsh
+        run: ./scripts/smoke_gguf.ps1
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-windows-gguf
+          path: |
+            logs/
+            smoke-gguf.log
+
+  # ---------------------------------------------------------------------------
+  # Job 3: macOS Apple Silicon - MLX backend + REAL token generation
+  # ---------------------------------------------------------------------------
+  macos-mlx:
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Record environment
+        run: |
+          mkdir -p logs
+          {
+            echo "uname: $(uname -a)"
+            echo "cpu:   $(sysctl -n machdep.cpu.brand_string)"
+            echo "cmake: $(cmake --version | head -n1)"
+            echo "cxx:   $(clang++ --version | head -n1)"
+          } | tee logs/env.txt
+          {
+            echo "## macos-mlx"
+            echo '```'
+            cat logs/env.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure (llama.cpp + mlx backends)
+        run: |
+          set -o pipefail
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DPRESTO_WITH_MLX=ON 2>&1 | tee logs/01-configure.log
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cmake --build build --config Release --parallel 3 2>&1 | tee logs/02-build.log
+
+      - name: Unit tests
+        run: ./build/presto_tests 2>&1 | tee logs/03-tests.log
+
+      - name: Smoke - MLX real token generation
+        run: bash scripts/smoke_mlx.sh 2>&1 | tee logs/04-smoke-mlx.log
+
+      - name: Smoke - GGUF via Metal
+        run: bash scripts/smoke_gguf.sh 2>&1 | tee logs/04-smoke-gguf.log
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-macos-mlx
+          path: |
+            logs/
+            smoke-gguf.log
+            smoke-mlx.log
