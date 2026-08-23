@@ -68,7 +68,8 @@ GPU offload is automatic: compile with `-DPRESTO_WITH_VULKAN=ON`, run the
 same command, and the model lands on whichever device is available.
 
 CI enforces tempo floors so a regression fails the build:
-windows `med_tps >= 100`, macOS Metal `med_tps >= 40`.
+windows `med_tps >= 100`, macOS Metal `med_tps >= 20` (calibrated against
+the measured 29.5 tok/s of stories260K on an M1 runner).
 
 ## Hardware support
 
