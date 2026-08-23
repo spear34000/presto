@@ -7,6 +7,10 @@
 
 namespace presto {
 
+// Persistent llama.cpp engine: model and context are created once at load()
+// and reused across generate() calls. The KV memory is cleared between calls
+// so every request starts from a clean state without reallocating buffers -
+// this is what keeps server-mode latency stable.
 class LlamaCppBackend : public IBackend {
 public:
   explicit LlamaCppBackend(std::string model_path);

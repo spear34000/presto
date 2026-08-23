@@ -12,6 +12,58 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Job: Linux hardware-backend build gate - CUDA (NVIDIA) + Vulkan
+  # (NVIDIA/AMD/Intel) must always compile & link. Runtime GPU tests are not
+  # possible on hosted runners (no GPUs); runtime coverage happens on
+  # developer machines with real devices.
+  # ---------------------------------------------------------------------------
+  linux-hw-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vulkan SDK (LunarG)
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan.list https://packages.lunarg.com/vulkan/lunarg-vulkan-$(lsb_release -cs).list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq vulkan-sdk
+          glslc --version
+
+      - name: Record environment
+        run: |
+          mkdir -p logs
+          {
+            echo "uname: $(uname -a)"
+            echo "cmake: $(cmake --version | head -n1)"
+            echo "gcc:   $(g++ --version | head -n1)"
+            echo "nvcc:  $(nvcc --version | tail -n1)"
+          } | tee logs/env.txt
+
+      - name: Configure (CUDA + Vulkan backends)
+        run: |
+          set -o pipefail
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DPRESTO_WITH_LLAMACPP=ON \
+                -DPRESTO_WITH_CUDA=ON -DPRESTO_WITH_VULKAN=ON -DPRESTO_BUILD_TESTS=OFF \
+                2>&1 | tee logs/01-configure.log
+
+      - name: Build presto (compile + link check for hw backends)
+        run: |
+          set -o pipefail
+          cmake --build build --config Release --target presto --parallel 2>&1 | tee logs/02-build.log
+
+      - name: Capability report
+        run: ./build/presto version | tee logs/03-version.log
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-linux-hw-build
+          path: logs/
+
+  # ---------------------------------------------------------------------------
   # Job 1: fast gate - core parsers + unit tests, no heavy backends
   # ---------------------------------------------------------------------------
   ubuntu-core:
@@ -95,6 +147,23 @@ jobs:
         shell: pwsh
         run: ./scripts/smoke_gguf.ps1
 
+      # Tempo gate: decode throughput must stay above the floor or this is a
+      # performance regression worth failing CI over.
+      - name: Tempo gate (CPU baseline)
+        shell: pwsh
+        run: |
+          $env:PRESTO_SMOKE = "1"
+          $exe = Get-ChildItem -Recurse build -Filter presto.exe | Select-Object -First 1
+          $out = & $exe.FullName bench models/stories260K.gguf --steps 96 --warmup 8 --runs 3 2>&1 |
+              Tee-Object -FilePath logs/05-bench.log
+          foreach ($l in $out) { Write-Host $l }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $line = ($out | Where-Object { $_ -like "*presto-bench*" } | Select-Object -First 1)
+          if (-not $line) { Write-Host "FAILED: no bench marker"; exit 1 }
+          $tps = [double]([regex]::Match($line, 'med_tps=([0-9.]+)').Groups[1].Value)
+          Write-Host "med_tps=$tps floor=100"
+          if ($tps -lt 100) { Write-Host "FAILED: tempo below floor"; exit 1 }
+
       - name: Upload failure logs
         if: failure()
         uses: actions/upload-artifact@v4
@@ -158,6 +227,15 @@ jobs:
         run: |
           set -o pipefail
           bash scripts/smoke_gguf.sh 2>&1 | tee logs/04-smoke-gguf.log
+
+      - name: Tempo gate (Metal GGUF)
+        run: |
+          set -o pipefail
+          PRESTO_SMOKE=1 ./build/presto bench models/stories260K.gguf --steps 96 --warmup 8 --runs 3 2>&1 |
+              tee logs/05-bench.log
+          tps=$(grep -o 'med_tps=[0-9.]*' logs/05-bench.log | cut -d= -f2)
+          echo "med_tps=$tps floor=40"
+          awk -v v="$tps" 'BEGIN { if (v+0 < 40) { print "FAILED: tempo below floor"; exit 1 } }'
 
       - name: Upload failure logs
         if: failure()

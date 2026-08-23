@@ -12,7 +12,9 @@
 #include "backends/mlx_backend.hpp"
 #endif
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,7 +26,7 @@
 namespace presto {
 namespace {
 
-constexpr const char* kVersion = "0.1.0";
+constexpr const char* kVersion = "0.2.0";
 
 enum ExitCode : int {
   kOk = 0,
@@ -41,16 +43,21 @@ void print_error_line(const std::string& step, const std::string& msg) {
 
 void print_usage(std::FILE* out) {
   std::fprintf(out,
-               "presto %s - unified LLM runtime (gguf | safetensors | pytorch | awq | gptq | mlx)\n\n"
+               "presto %s - unified LLM runtime (gguf | safetensors | pytorch | awq | gptq | mlx)\n"
+               "\"presto\": Italian musical term - very fast (172-208 BPM). We take the marking seriously.\n\n"
                "USAGE:\n"
                "  presto info <model-path>\n"
                "  presto run <model-path> [--prompt \"...\"] [--prompt-tokens \"1,2,3\"]\n"
                "              [--max-tokens N] [--temp F] [--seed N]\n"
+               "  presto bench <model-path> [--steps N] [--warmup N] [--runs N]\n"
+               "              [--temp F]\n"
                "  presto serve <model-path> [--host H] [--port P]\n"
                "  presto version\n\n"
                "ENV:\n"
                "  PRESTO_LOG=debug|info|warn|error   log level (stderr)\n"
-               "  PRESTO_SMOKE=1                     emit machine-readable success line on run\n",
+               "  PRESTO_SMOKE=1                     emit machine-readable success line on run\n"
+               "  PRESTO_THREADS=N                   inference threads (default: hw threads, cap 8)\n"
+               "  PRESTO_CTX=N                       context size for gguf models (default 4096)\n",
                kVersion);
 }
 
@@ -88,7 +95,8 @@ std::vector<int> parse_token_list(const std::string& s, bool& ok) {
 
 int cmd_version() {
   const BackendCaps caps = backend_caps();
-  std::printf("presto v%s\n", kVersion);
+  std::printf("presto v%s - \"presto\": very fast (Italian, musical tempo; 172-208 BPM)\n",
+              kVersion);
 #if defined(_WIN32)
   std::printf("platform: windows\n");
 #elif defined(__APPLE__)
@@ -98,6 +106,29 @@ int cmd_version() {
 #endif
   std::printf("backends: llamacpp=%s mlx=%s\n", caps.llamacpp ? "YES" : "no",
               caps.mlx ? "YES" : "no");
+  std::printf(
+      "hw      : cuda=%s vulkan=%s hip=%s metal=%s cpu=yes\n",
+#if defined(PRESTO_HW_CUDA)
+      "yes",
+#else
+      "no",
+#endif
+#if defined(PRESTO_HW_VULKAN)
+      "yes",
+#else
+      "no",
+#endif
+#if defined(PRESTO_HW_HIP)
+      "yes",
+#else
+      "no",
+#endif
+#if defined(PRESTO_HW_METAL)
+      "yes"
+#else
+      "no"
+#endif
+  );
   std::printf(
       "formats : gguf safetensors pytorch awq gptq mlx (info+inspection on all platforms)\n");
   std::printf("execute : %s\n",
@@ -233,6 +264,127 @@ int cmd_run(const std::vector<std::string>& args) {
   return kOk;
 }
 
+const char* tempo_marking(double tok_per_sec) {
+  if (tok_per_sec >= 1000) return "prestissimo";
+  if (tok_per_sec >= 200) return "presto";
+  if (tok_per_sec >= 80) return "allegro";
+  if (tok_per_sec >= 40) return "moderato";
+  return "andante";
+}
+
+int cmd_bench(const std::vector<std::string>& args) {
+  if (args.empty()) {
+    print_usage(stderr);
+    return kUsage;
+  }
+
+  std::string model_path = args[0];
+  std::string prompt = "The quick brown fox";
+  int steps = 128, warmup = 8, runs = 5;
+  float temp = 0.0f;
+
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    const std::string& a = args[i];
+    auto next_int = [&](int& dst) -> bool {
+      if (i + 1 >= args.size()) return false;
+      long long v = 0;
+      if (!parse_int(args[++i].c_str(), v)) return false;
+      dst = static_cast<int>(v);
+      return true;
+    };
+    auto next_float = [&](float& dst) -> bool {
+      if (i + 1 >= args.size()) return false;
+      return parse_float(args[++i].c_str(), dst);
+    };
+    if (a == "--steps" && next_int(steps)) continue;
+    if (a == "--warmup" && next_int(warmup)) continue;
+    if (a == "--runs" && next_int(runs)) continue;
+    if (a == "--temp" && next_float(temp)) continue;
+    if (a == "--prompt" && i + 1 < args.size()) {
+      prompt = args[++i];
+      continue;
+    }
+    print_error_line("usage", "unknown bench option '" + a + "'");
+    return kUsage;
+  }
+  steps = std::max(1, std::min(steps, 4096));
+  warmup = std::max(0, std::min(warmup, 64));
+  runs = std::max(1, std::min(runs, 64));
+
+  const Detection d = detect_format(model_path);
+  if (d.format == ModelFormat::UNKNOWN) {
+    print_error_line("detect", d.summary);
+    return kUnsupportedFormat;
+  }
+  std::string err;
+  auto backend = select_backend(d, err);
+  if (!backend) {
+    print_error_line("select_backend", err);
+    return (d.format == ModelFormat::GGUF || d.format == ModelFormat::MLX_DIR)
+               ? kBackendUnavailable
+               : kUnsupportedFormat;
+  }
+  if (!backend->load(err)) {
+    print_error_line("load", err);
+    return kInferenceFailure;
+  }
+
+  GenerateParams p;
+  p.prompt_text = prompt;
+  p.max_tokens = steps;
+  p.temp = temp;
+  p.seed = 42;
+
+  for (int i = 0; i < warmup; ++i) {
+    GenerateResult w;
+    p.max_tokens = std::min(steps, 16);
+    if (!backend->generate(p, w, err)) {
+      print_error_line("warmup", err);
+      return kInferenceFailure;
+    }
+  }
+  p.max_tokens = steps;
+
+  std::vector<double> tps;
+  double med_prefill = 0.0;
+  tps.reserve(static_cast<std::size_t>(runs));
+  for (int run = 0; run < runs; ++run) {
+    GenerateResult r;
+    if (!backend->generate(p, r, err)) {
+      print_error_line("bench_run", err);
+      return kInferenceFailure;
+    }
+    tps.push_back(r.tok_per_sec);
+    med_prefill += r.prefill_sec;
+  }
+  med_prefill /= static_cast<double>(runs);
+
+  std::sort(tps.begin(), tps.end());
+  const double median =
+      tps.size() % 2 == 1
+          ? tps[tps.size() / 2]
+          : 0.5 * (tps[tps.size() / 2 - 1] + tps[tps.size() / 2]);
+  double var = 0.0;
+  for (double v : tps) var += (v - median) * (v - median);
+  const double sigma = std::sqrt(var / static_cast<double>(tps.size()));
+  const double spread_pct = median > 0 ? 100.0 * sigma / median : 0.0;
+
+  std::printf("=== Tempo Report: %s ===\n", model_path.c_str());
+  std::printf("backend : %s   format: %s\n", backend->name(), format_name(d.format));
+  std::printf("runs    : %d x %d tok (warmup %d, temp %.2f)\n", runs, steps, warmup, temp);
+  std::printf("prefill : median %.4f s\n", med_prefill);
+  std::printf("decode  : min/med/max = %.1f / %.1f / %.1f tok/s   sigma=%.2f (+-%.1f%%)\n",
+              tps.front(), median, tps.back(), sigma, spread_pct);
+  std::printf("tempo   : %.1f tok/s - marking \"%s\"\n", median,
+              tempo_marking(median));
+  if (const char* smoke = std::getenv("PRESTO_SMOKE"); smoke && std::strcmp(smoke, "1") == 0) {
+    std::printf(
+        "[presto-bench] backend=%s format=%s steps=%d med_tps=%.2f sigma=%.2f ok=true\n",
+        backend->name(), format_name(d.format), steps, median, sigma);
+  }
+  return kOk;
+}
+
 } // namespace
 } // namespace presto
 
@@ -252,6 +404,7 @@ int main(int argc, char** argv) {
     if (cmd == "version") return cmd_version();
     if (cmd == "info") return cmd_info({argv + 2, argv + argc});
     if (cmd == "run") return cmd_run({argv + 2, argv + argc});
+    if (cmd == "bench") return cmd_bench({argv + 2, argv + argc});
     if (cmd == "serve") {
       std::vector<std::string> args{argv + 2, argv + argc};
       if (args.empty()) {

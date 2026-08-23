@@ -19,6 +19,8 @@ struct GenerateResult {
   std::string text;
   double tok_per_sec = 0.0;
   double load_sec = 0.0;
+  double prefill_sec = 0.0;  // prompt evaluation time
+  double decode_sec = 0.0;   // token-by-token generation time
 };
 
 class IBackend {

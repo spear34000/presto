@@ -1,99 +1,130 @@
-# presto
+# presto 🎶
 
-Unified LLM inference runtime in C++ - one binary that inspects **all** major model
-formats and executes GGUF and MLX models natively.
+> **presto** /ˈprɛs.to/ - Italian musical term: *very fast* (172-208 BPM).
+> A unified LLM inference runtime that takes the marking seriously.
 
-Built by surveying the most popular open-source runtimes (stars verified 2026-08) and
-absorbing the best idea of each:
+One static C++ binary that inspects every major model format, executes GGUF and
+MLX natively, and runs on whatever silicon you have: NVIDIA, AMD Radeon,
+Intel iGPU/Arc via Vulkan, Apple Silicon via Metal and MLX, or plain x86 CPU.
+
+## Why presto (tempo = tokens)
+
+Built by surveying the most popular open-source runtimes (stars verified 2026-08)
+and absorbing the best idea of each:
 
 | # | Runtime | Stars | Idea presto absorbs |
 |---|---------|-------|---------------------|
 | 1 | [ollama](https://github.com/ollama/ollama) | ~179k | one-command UX + OpenAI-compatible server |
-| 2 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | ~125k | native GGUF execution on every CPU/GPU |
+| 2 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | ~125k | native GGUF execution, broadest hardware |
 | 3 | [vLLM](https://github.com/vllm-project/vllm) | ~90k | OpenAI `/v1/*` API surface |
 | 4 | [SGLang](https://github.com/sgl-project/sglang) | ~32k | (roadmap: prefix caching) |
 | 5 | [MLX](https://github.com/ml-explore/mlx) / mlx-lm | ~28k | Apple-Silicon-native weight format |
 | 7 | [ktransformers](https://github.com/kvcache-ai/ktransformers) | ~19k | heterogeneous backend routing |
 
+## Tempo Report (measured, not promised)
+
+Every build ships `presto bench`, which measures decode throughput across
+repeated runs and reports min/median/max and sigma. Stability is a feature:
+the sigma number IS the stability claim.
+
+Measured locally (Windows 11, Intel Arc 140V iGPU, stories15M-q4_0.gguf,
+256 tokens x 5 runs):
+
+| Device | Median tok/s | Marking | Sigma |
+|---|---|---|---|
+| Intel Arc 140V (Vulkan offload) | **707.1** | presto | ±12.3% |
+| Same machine, CPU only          | 247.5   | presto | ±10.1% |
+
+GPU offload was automatic: compile with `-DPRESTO_WITH_VULKAN=ON`, run the
+same command, and the model lands on whichever device is available.
+
+CI enforces tempo floors so a regression fails the build:
+windows `med_tps >= 100`, macOS Metal `med_tps >= 40`.
+
+## Hardware support
+
+| Hardware | Path | Build flag | Status |
+|---|---|---|---|
+| NVIDIA (discrete)      | CUDA   | `-DPRESTO_WITH_CUDA=ON`   | CI-verified builds; runtime needs NVIDIA GPU |
+| NVIDIA / AMD / Intel   | Vulkan | `-DPRESTO_WITH_VULKAN=ON` | **runtime-verified on Intel Arc 140V** |
+| AMD Radeon (Linux)     | HIP    | `-DPRESTO_WITH_HIP=ON`    | builds; runtime needs ROCm device |
+| Apple Silicon          | Metal + MLX | auto ON on macOS     | CI runtime-verified every push |
+| x86 CPU (Intel/AMD)    | ggml CPU (AVX dispatch) | default  | always available |
+
+Control layer offload with `PRESTO_GPU_LAYERS` (`-1` = auto/max, `0` = CPU-only,
+N = exact layers).
+
 ## Format support
 
 | Format | Inspect (`presto info`) | Execute |
 |---|---|---|
-| GGUF (`.gguf`)            | full metadata parse (pure C++)      | YES - llama.cpp backend (Windows/macOS/Linux) |
+| GGUF (`.gguf`)            | full metadata parse (pure C++)      | YES - llama.cpp backend |
 | MLX dir (mlx-lm layout)   | config + quantization detection     | YES - mlx core backend (Apple Silicon), token-id level |
 | SafeTensors (`.safetensors`) | tensor inventory + dtype histogram | roadmap (convert to GGUF/MLX) |
 | PyTorch (`.pt`/`.pth`/`.ckpt`) | zip container detection        | roadmap (conversion pipeline) |
 | AWQ dirs                  | bits / group_size extraction        | roadmap |
 | GPTQ dirs                 | quant_method / bits extraction      | roadmap |
 
-Inspection works everywhere with zero dependencies; execution backends are compiled in
-when their platform is available.
-
 ## Build
 
 ```bash
-# full build (llama.cpp backend; MLX auto-enables on Apple Silicon)
+# baseline: CPU only
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --parallel
 
-# core-only build (no network-heavy deps, fastest)
-cmake -B build-core -DPRESTO_WITH_LLAMACPP=OFF
-cmake --build build-core --config Release --parallel
+# your GPU: add one flag
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DPRESTO_WITH_VULKAN=ON   # NVIDIA/AMD/Intel
+# cmake -B build ... -DPRESTO_WITH_CUDA=ON                          # NVIDIA
+# cmake -B build ... -DPRESTO_WITH_HIP=ON                           # AMD ROCm
+cmake --build build --config Release --parallel
+
+# core-only (no network-heavy deps)
+cmake -B build-core -DPRESTO_WITH_LLAMACPP=OFF && cmake --build build-core --config Release --parallel
 ```
 
-Dependencies are fetched via CMake FetchContent and pinned:
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) `b21e4de74...` (verified commit)
-- [cpp-httplib](https://github.com/yhirose/cpp-httplib) v0.15.3
-- [MLX](https://github.com/ml-explore/mlx) main (macOS arm64 only)
-
-Requires CMake >= 3.24 and a C++20 compiler (MSVC 2022, clang, gcc).
+Dependencies are FetchContent'd and pinned: llama.cpp `b21e4de74...`,
+cpp-httplib v0.15.3, MLX v0.32.1. Requires CMake >= 3.24, C++20.
 
 ## Usage
 
 ```bash
-./build/presto version                 # capability report
-./build/presto info model.gguf         # deep inspection of ANY supported format
-./build/presto info ./mlx-model-dir/
+./build/presto version                  # capability report incl. hw backends
+./build/presto info model.gguf          # deep inspection of ANY supported format
 
-./build/presto run model.gguf \
-    --prompt "Once upon a time" --max-tokens 64 --temp 0.8 --seed 42
+./build/presto run model.gguf --prompt "Once upon a time" --max-tokens 64 --temp 0.8
 
-./build/presto run ./tiny_mlx --prompt-tokens "1,2,3" --max-tokens 8   # token-id level (MLX)
-
-./build/presto serve model.gguf --port 8000
+./build/presto bench model.gguf --steps 128 --runs 5     # Tempo Report
+./build/presto serve model.gguf --port 8000              # OpenAI-compatible API
 curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Exit codes: `0` ok · `1` generic · `2` usage · `3` unsupported format ·
-`4` backend unavailable · `5` inference failure.
-Set `PRESTO_SMOKE=1` to emit `[presto-smoke] ... ok=true` for scripting.
-Set `PRESTO_LOG=debug` for verbose logging.
+Env: `PRESTO_THREADS` (inference threads) · `PRESTO_CTX` (context size) ·
+`PRESTO_GPU_LAYERS` (offload control) · `PRESTO_LOG` · `PRESTO_SMOKE=1`.
+
+Exit codes: `0` ok · `2` usage · `3` unsupported format · `4` backend unavailable · `5` failure.
 
 ## Tests
 
-Zero-dependency unit tests cover the JSON parser, GGUF header parser,
-safetensors parser, format detection and backend routing with synthetic
-fixtures:
+Zero-dependency unit tests (18 cases): JSON parser, GGUF header parser,
+safetensors parser, format detection, backend routing.
 
 ```bash
-cmake --build build --config Release
-./build/presto_tests          # prints ALL TESTS PASSED
+cmake --build build --config Release && ./build/presto_tests   # ALL TESTS PASSED
 ```
 
 ## CI
 
-GitHub Actions runs three jobs on every push:
-
 | Job | Runner | Verifies |
 |-----|--------|----------|
 | `ubuntu-core` | ubuntu-latest | core-only build + unit tests (fast gate) |
-| `windows-gguf` | windows-latest | MSVC + llama.cpp static link + **real GGUF token generation** |
-| `macos-mlx` | macos-15 (arm64) | clang + MLX v0.32.1 link + **real MLX token generation** + Metal GGUF |
+| `linux-hw-build` | ubuntu-latest | CUDA + Vulkan toolchains compile & link |
+| `windows-gguf` | windows-latest | MSVC + llama.cpp + real generation + tempo gate |
+| `macos-mlx` | macos-15 (arm64) | real MLX weights generate tokens + Metal GGUF + tempo gate |
 
-Failures always upload a `logs-*` artifact containing configure/build/test/smoke logs
-and environment info; smoke scripts print `[presto-smoke]` markers so a single log
-line tells you exactly which stage produced tokens and at what throughput.
+Failures always upload `logs-*` artifacts (configure/build/test/smoke/bench logs +
+environment info); smoke and bench emit `[presto-smoke]` / `[presto-bench]` markers,
+so one log line identifies the failing stage.
 
 ## License
 

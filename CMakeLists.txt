@@ -27,6 +27,17 @@ include(FetchContent)
 # ---------------------------------------------------------------------------
 # llama.cpp backend (GGUF execution)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Hardware acceleration backends (llama.cpp/ggml based)
+#   CUDA   : NVIDIA discrete GPUs
+#   VULKAN : NVIDIA / AMD Radeon / Intel iGPU+Arc (cross-vendor)
+#   HIP    : AMD Radeon via ROCm (Linux preferred)
+#   METAL  : Apple Silicon (auto ON with llama.cpp on macOS)
+# ---------------------------------------------------------------------------
+option(PRESTO_WITH_CUDA "Build NVIDIA CUDA GPU backend" OFF)
+option(PRESTO_WITH_VULKAN "Build Vulkan GPU backend (NVIDIA/AMD/Intel)" OFF)
+option(PRESTO_WITH_HIP "Build AMD HIP/ROCm GPU backend" OFF)
+
 if(PRESTO_WITH_LLAMACPP)
   set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -35,11 +46,33 @@ if(PRESTO_WITH_LLAMACPP)
   # Static ggml/llama keeps a single self-contained executable: shared builds
   # scatter ggml-cpu.dll that ggml_backend_load_all() cannot locate reliably.
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  if(PRESTO_WITH_CUDA)
+    set(GGML_CUDA ON CACHE BOOL "" FORCE)
+  endif()
+  if(PRESTO_WITH_VULKAN)
+    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+  endif()
+  if(PRESTO_WITH_HIP)
+    set(GGML_HIP ON CACHE BOOL "" FORCE)
+  endif()
   FetchContent_Declare(llama_cpp
       GIT_REPOSITORY https://github.com/ggml-org/llama.cpp
       GIT_TAG ${PRESTO_LLAMA_TAG}
       GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(llama_cpp)
+endif()
+
+if(APPLE AND PRESTO_WITH_LLAMACPP)
+  set(PRESTO_HW_METAL_DEF ON)
+endif()
+if(PRESTO_WITH_CUDA)
+  set(PRESTO_HW_CUDA_DEF ON)
+endif()
+if(PRESTO_WITH_VULKAN)
+  set(PRESTO_HW_VULKAN_DEF ON)
+endif()
+if(PRESTO_WITH_HIP)
+  set(PRESTO_HW_HIP_DEF ON)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -76,6 +109,19 @@ if(PRESTO_WITH_LLAMACPP)
   target_compile_definitions(presto PRIVATE PRESTO_WITH_LLAMACPP=1)
   target_sources(presto PRIVATE src/backends/llamacpp_backend.cpp)
   target_link_libraries(presto PRIVATE llama)
+endif()
+
+if(PRESTO_HW_CUDA_DEF)
+  target_compile_definitions(presto PRIVATE PRESTO_HW_CUDA=1)
+endif()
+if(PRESTO_HW_VULKAN_DEF)
+  target_compile_definitions(presto PRIVATE PRESTO_HW_VULKAN=1)
+endif()
+if(PRESTO_HW_HIP_DEF)
+  target_compile_definitions(presto PRIVATE PRESTO_HW_HIP=1)
+endif()
+if(PRESTO_HW_METAL_DEF)
+  target_compile_definitions(presto PRIVATE PRESTO_HW_METAL=1)
 endif()
 
 # ---------------------------------------------------------------------------
