@@ -114,6 +114,9 @@ int run_openai_server(const Detection& d, const std::string& host, int port) {
 
   httplib::Server svr;
   std::atomic<long long> req_counter{0};
+  // one engine instance -> generation must be serialized; httplib dispatches
+  // connections on multiple threads
+  std::mutex gen_mutex;
   const std::string model_field = json_escape(d.path);
 
   svr.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
@@ -130,6 +133,7 @@ int run_openai_server(const Detection& d, const std::string& host, int port) {
 
   auto handle_generate = [&](bool chat, const httplib::Request& req,
                              httplib::Response& res) {
+    std::lock_guard<std::mutex> lock(gen_mutex);
     RequestOpts opts;
     std::string perr;
     if (!parse_request_body(req.body, chat, opts, perr)) {

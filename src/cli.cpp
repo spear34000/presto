@@ -119,7 +119,7 @@ int cmd_version() {
   std::printf("backends: llamacpp=%s mlx=%s\n", caps.llamacpp ? "YES" : "no",
               caps.mlx ? "YES" : "no");
   std::printf(
-      "hw      : cuda=%s vulkan=%s hip=%s metal=%s cpu=yes\n",
+      "hw      : cuda=%s vulkan=%s hip=%s sycl=%s metal=%s cpu=yes\n",
 #if defined(PRESTO_HW_CUDA)
       "yes",
 #else
@@ -131,6 +131,11 @@ int cmd_version() {
       "no",
 #endif
 #if defined(PRESTO_HW_HIP)
+      "yes",
+#else
+      "no",
+#endif
+#if defined(PRESTO_HW_SYCL)
       "yes",
 #else
       "no",
