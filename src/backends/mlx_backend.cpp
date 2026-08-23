@@ -308,12 +308,6 @@ bool MlxBackend::load(std::string& err) {
 
 namespace {
 
-mx::array make_f32_array(const TensorData& t) {
-  // mlx's Shape is a SmallVector<int32_t>; convert our std::vector<int> explicitly
-  const mx::Shape shp(t.shape.begin(), t.shape.end());
-  return mx::array(t.data.data(), shp);
-}
-
 // x[T,H]: (x * w[H]) / sqrt(mean(x^2)+eps)
 mx::array rms_norm(const mx::array& x, const mx::array& w, float eps) {
   const mx::array msq = mx::mean(mx::multiply(x, x), {-1}, true);
@@ -352,8 +346,26 @@ bool MlxBackend::generate(const GenerateParams& gp, GenerateResult& r, std::stri
   for (int h = 0; h < nh; ++h) kv_idx.push_back(static_cast<std::int32_t>(h / (nh / nkv)));
 
   try {
-    const mx::array embed = make_f32_array(I.weights.at("model.embed_tokens.weight"));
-    const mx::array norm_w = make_f32_array(I.weights.at("model.norm.weight"));
+    // Projection matrices are stored [out,in] row-major; mlx matmul expects
+    // [in,out]. Transpose them once up front. Norm vectors stay untouched,
+    // embeddings must keep axis 0 = vocab for take().
+    const auto needs_transpose = [](const std::string& n) {
+      const std::string suffix = "_proj.weight";
+      if (n.size() >= suffix.size() &&
+          n.compare(n.size() - suffix.size(), suffix.size(), suffix) == 0)
+        return true;
+      return n == "lm_head.weight";
+    };
+    std::unordered_map<std::string, mx::array> W;
+    W.reserve(I.weights.size());
+    for (const auto& [name, t] : I.weights) {
+      mx::Shape shp(t.shape.begin(), t.shape.end());
+      mx::array a(t.data.data(), shp);
+      W[name] = needs_transpose(name) ? mx::transpose(a) : a;
+    }
+
+    const mx::array& embed = W.at("model.embed_tokens.weight");
+    const mx::array& norm_w = W.at("model.norm.weight");
 
     const auto gen_t0 = std::chrono::steady_clock::now();
     std::vector<int> out_tokens;
@@ -400,15 +412,15 @@ bool MlxBackend::generate(const GenerateParams& gp, GenerateResult& r, std::stri
 
       for (int l = 0; l < I.num_layers; ++l) {
         const std::string p = "model.layers." + std::to_string(l) + ".";
-        const auto W = [&](const char* n) { return make_f32_array(I.weights.at(p + n)); };
+        const auto wt = [&](const char* n) { return W.at(p + n); };
 
         // --- self attention ---
-        mx::array h = rms_norm(x, W("input_layernorm.weight"), I.rms_eps);
+        mx::array h = rms_norm(x, wt("input_layernorm.weight"), I.rms_eps);
 
-        const mx::array q = rope_apply(mx::matmul(h, W("self_attn.q_proj.weight")), nh);
-        const mx::array k = rope_apply(mx::matmul(h, W("self_attn.k_proj.weight")), nkv);
+        const mx::array q = rope_apply(mx::matmul(h, wt("self_attn.q_proj.weight")), nh);
+        const mx::array k = rope_apply(mx::matmul(h, wt("self_attn.k_proj.weight")), nkv);
         const mx::array v =
-            mx::reshape(mx::matmul(h, W("self_attn.v_proj.weight")), {T, nkv, dh});
+            mx::reshape(mx::matmul(h, wt("self_attn.v_proj.weight")), {T, nkv, dh});
 
         const mx::array kv_index = mx::array(kv_idx.data(), {nh});
         const mx::array k_rep = mx::take(k, kv_index, 1);
@@ -420,24 +432,22 @@ bool MlxBackend::generate(const GenerateParams& gp, GenerateResult& r, std::stri
         const mx::array probs = mx::softmax(scores, -1);
         mx::array attn = mx::matmul(probs, v_rep);  // [T,nh,dh]
         attn = mx::reshape(attn, {T, H});
-        attn = mx::matmul(attn, W("self_attn.o_proj.weight"));
+        attn = mx::matmul(attn, wt("self_attn.o_proj.weight"));
         x = mx::add(x, attn);
 
         // --- mlp ---
-        h = rms_norm(x, W("post_attention_layernorm.weight"), I.rms_eps);
-        const mx::array g = mx::matmul(h, W("mlp.gate_proj.weight"));
-        const mx::array u = mx::matmul(h, W("mlp.up_proj.weight"));
+        h = rms_norm(x, wt("post_attention_layernorm.weight"), I.rms_eps);
+        const mx::array g = mx::matmul(h, wt("mlp.gate_proj.weight"));
+        const mx::array u = mx::matmul(h, wt("mlp.up_proj.weight"));
         const mx::array sig =
             mx::divide(mx::array(1.0), mx::add(mx::array(1.0), mx::exp(mx::negative(g))));
         const mx::array gated = mx::multiply(mx::multiply(g, sig), u);
-        const mx::array mlp = mx::matmul(gated, W("mlp.down_proj.weight"));
+        const mx::array mlp = mx::matmul(gated, wt("mlp.down_proj.weight"));
         x = mx::add(x, mlp);
       }
-
       x = rms_norm(x, norm_w, I.rms_eps);
-      mx::array logits = use_separate_lm_head
-                             ? mx::matmul(x, make_f32_array(I.weights.at("lm_head.weight")))
-                             : mx::matmul(x, embed);
+      mx::array logits =
+          use_separate_lm_head ? mx::matmul(x, W.at("lm_head.weight")) : mx::matmul(x, embed);
       mx::eval(logits);
 
       const mx::array last_row = mx::reshape(
