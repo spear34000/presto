@@ -60,7 +60,8 @@ jobs:
       - name: Build presto (compile + link check for hw backends)
         run: |
           set -o pipefail
-          cmake --build build --config Release --target presto --parallel 2>&1 | tee logs/02-build.log
+          # low parallelism: nvcc + shader-gen concurrently exceed runner RAM
+          cmake --build build --config Release --target presto --parallel 2 2>&1 | tee logs/02-build.log
 
       - name: Capability report
         run: ./build/presto version | tee logs/03-version.log
