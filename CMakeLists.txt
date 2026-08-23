@@ -55,6 +55,10 @@ if(PRESTO_WITH_LLAMACPP)
   if(PRESTO_WITH_HIP)
     set(GGML_HIP ON CACHE BOOL "" FORCE)
   endif()
+  # llama.cpp disables tools in FetchContent mode (LLAMA_STANDALONE=OFF);
+  # force them on so llama-bench stays available for comparison benchmarks
+  set(LLAMA_BUILD_TOOLS ON CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
   FetchContent_Declare(llama_cpp
       GIT_REPOSITORY https://github.com/ggml-org/llama.cpp
       GIT_TAG ${PRESTO_LLAMA_TAG}

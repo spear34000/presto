@@ -27,15 +27,44 @@ Every build ships `presto bench`, which measures decode throughput across
 repeated runs and reports min/median/max and sigma. Stability is a feature:
 the sigma number IS the stability claim.
 
-Measured locally (Windows 11, Intel Arc 140V iGPU, stories15M-q4_0.gguf,
-256 tokens x 5 runs):
+### Head-to-head on one machine
+
+Windows 11, Intel/AMD CPU 4 threads, stories15M-q4_0.gguf, 128-token decode,
+temperature 0:
+
+| Runtime | Median tok/s | Sigma | vs presto |
+|---|---|---|---|
+| **presto** (`presto bench`)            | **1724** | ±2.8% | - |
+| llama.cpp stock (`llama-bench` tg128)  | 1720     | ±3.6% | 1.00x |
+| ollama 0.32.15 (`/api/generate`)       | 1016     | n/a   | **1.70x faster** |
+
+Same kernels as llama.cpp (we link it) with zero serving overhead; ollama's
+daemon+HTTP stack costs ~40% of throughput at this scale.
+
+### Prefix KV cache (SGLang RadixAttention idea)
+
+Consecutive requests sharing token history skip re-prefill entirely -
+multi-turn chat, agent loops and fixed system prompts get near-zero
+time-to-first-token on the shared part. Measured in-process on
+stories15M-q4_0 (serve mode):
+
+```
+prefix reuse: kept 385/398 tokens    <- 97% of prompt prefill skipped
+```
+
+Greedy outputs are byte-identical with `PRESTO_PREFIX_CACHE=0`, so the
+speedup is free of behavioral change.
+
+### GPU offload
+
+Windows 11, Intel Arc 140V iGPU, stories15M-q4_0.gguf, 256 tokens x 5 runs:
 
 | Device | Median tok/s | Marking | Sigma |
 |---|---|---|---|
 | Intel Arc 140V (Vulkan offload) | **707.1** | presto | ±12.3% |
 | Same machine, CPU only          | 247.5   | presto | ±10.1% |
 
-GPU offload was automatic: compile with `-DPRESTO_WITH_VULKAN=ON`, run the
+GPU offload is automatic: compile with `-DPRESTO_WITH_VULKAN=ON`, run the
 same command, and the model lands on whichever device is available.
 
 CI enforces tempo floors so a regression fails the build:
