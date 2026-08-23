@@ -65,6 +65,12 @@ struct LlamaCppBackend::Impl {
   llama_context* ctx = nullptr;
   uint32_t n_ctx = 0;
   int32_t threads = 0;
+
+  // Prefix KV cache: token history currently resident in llama_memory.
+  // A new prompt sharing this prefix skips prefill for the shared part -
+  // multi-turn chats and repeated system prompts then cost near-zero TTFT.
+  std::vector<llama_token> cache_tokens;
+  bool cache_valid = false;
 };
 
 LlamaCppBackend::LlamaCppBackend(std::string path) : path_(std::move(path)) {}
@@ -134,14 +140,19 @@ bool LlamaCppBackend::load(std::string& err) {
   }
 
   // Warmup decode: pages in weights/compute buffers so the first real request
-  // does not pay cold-start costs. Failure here is non-fatal.
+  // does not pay cold-start costs. The BOS token stays resident in KV and
+  // seeds the prefix cache. Failure here is non-fatal.
   {
     llama_token bos = llama_vocab_bos(impl_->vocab);
     llama_batch b = llama_batch_get_one(&bos, 1);
     if (llama_decode(impl_->ctx, b) != 0) {
       PRESTO_LOG_WARN("llamacpp", "warmup decode failed; continuing");
+      llama_memory_clear(llama_get_memory(impl_->ctx), true);
+      impl_->cache_valid = false;
+    } else {
+      impl_->cache_tokens.assign(1, bos);
+      impl_->cache_valid = true;
     }
-    llama_memory_clear(llama_get_memory(impl_->ctx), true);
   }
 
   load_sec_ = now_sec() - t0;
@@ -185,14 +196,14 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
     return false;
   }
 
-  // Recreate the context only when a request exceeds its capacity - the rare
-  // path. Common requests reuse the persistent buffers.
+  // Recreate the context only when a request could exceed its capacity.
   const uint32_t needed = static_cast<uint32_t>(prompt.size() + gp.max_tokens + 8);
   if (needed > impl_->n_ctx) {
     uint32_t grown = impl_->n_ctx;
     while (grown < needed) grown *= 2;
-    PRESTO_LOG_INFO("llamacpp", "growing context " + std::to_string(impl_->n_ctx) + " -> " +
-                                    std::to_string(grown));
+    PRESTO_LOG_INFO("llamacpp",
+                    "growing context " + std::to_string(impl_->n_ctx) + " -> " +
+                        std::to_string(grown));
     llama_free(impl_->ctx);
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = grown;
@@ -202,35 +213,77 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
     impl_->ctx = llama_init_from_model(impl_->model, cparams);
     if (!impl_->ctx) {
       impl_->ctx = nullptr;
+      impl_->cache_valid = false;
       err = "step=grow_context msg=\"failed to recreate context at " +
             std::to_string(grown) + "\"";
       return false;
     }
     impl_->n_ctx = grown;
+    impl_->cache_valid = false;  // fresh memory: nothing resident to reuse
   }
 
-  llama_memory_clear(llama_get_memory(impl_->ctx), true);
+  // ---- prefix-cache aware prefill ----
+  // KV entries are exact functions of their token prefix, so a shared token
+  // prefix with the previous request can skip re-evaluation of those tokens
+  // and produce identical results.
+  llama_memory_t mem = llama_get_memory(impl_->ctx);
+  const bool cache_allowed =
+      [] {
+        const char* v = std::getenv("PRESTO_PREFIX_CACHE");
+        return !(v && *v && v[0] == '0');
+      }();
 
-  const int n_vocab = llama_n_vocab(impl_->vocab);
-  unsigned rng_state = gp.seed >= 0
-                           ? static_cast<unsigned>(gp.seed)
-                           : static_cast<unsigned>(
-                                 std::chrono::steady_clock::now().time_since_epoch().count());
+  size_t feed_from = 0;
+  if (cache_allowed && impl_->cache_valid) {
+    size_t common = 0;
+    const size_t limit = std::min(impl_->cache_tokens.size(), prompt.size());
+    while (common < limit && impl_->cache_tokens[common] == prompt[common]) ++common;
+    // keep [0, common), drop everything after it
+    if (!llama_memory_seq_rm(mem, 0, static_cast<llama_pos>(common), -1)) {
+      common = 0;  // partial removal unsupported by backend: full re-prefill
+      if (!llama_memory_seq_rm(mem, 0, -1, -1)) {
+        err = "step=prefill msg=\"failed to reset kv memory\"";
+        return false;
+      }
+    }
+    feed_from = common;
+    if (feed_from > 0) {
+      PRESTO_LOG_INFO("llamacpp",
+                      "prefix reuse: kept " + std::to_string(feed_from) + "/" +
+                          std::to_string(prompt.size()) + " tokens");
+    }
+  } else {
+    llama_memory_clear(mem, true);
+  }
+  // identical prompt to last request leaves zero new tokens; force at least
+  // one eval by dropping back one position
+  if (cache_allowed && impl_->cache_valid && feed_from >= prompt.size()) {
+    feed_from = prompt.size() >= 1 ? prompt.size() - 1 : 0;
+    llama_memory_seq_rm(mem, 0, static_cast<llama_pos>(feed_from), -1);
+  }
 
-  // ---- prefill ----
   const double prefill_t0 = now_sec();
-  int32_t processed = 0;
+  int32_t processed = static_cast<int32_t>(feed_from);
   while (processed < static_cast<int32_t>(prompt.size())) {
     const int32_t chunk =
         std::min<int32_t>(static_cast<int32_t>(impl_->n_ctx),
                           static_cast<int32_t>(prompt.size()) - processed);
-    if (llama_decode(impl_->ctx, llama_batch_get_one(prompt.data() + processed, chunk))) {
+    if (llama_decode(impl_->ctx,
+                     llama_batch_get_one(prompt.data() + processed, chunk))) {
       err = "step=prefill msg=\"decode failed at offset " + std::to_string(processed) + "\"";
+      impl_->cache_valid = false;
       return false;
     }
     processed += chunk;
   }
   r.prefill_sec = now_sec() - prefill_t0;
+
+  const int n_vocab = llama_n_vocab(impl_->vocab);
+  unsigned rng_state =
+      gp.seed >= 0
+          ? static_cast<unsigned>(gp.seed)
+          : static_cast<unsigned>(
+                std::chrono::steady_clock::now().time_since_epoch().count());
 
   // ---- decode ----
   const double decode_t0 = now_sec();
@@ -250,6 +303,7 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
     if (step + 1 < gp.max_tokens) {
       if (llama_decode(impl_->ctx, llama_batch_get_one(&out_tokens.back(), 1))) {
         err = "step=decode msg=\"decode failed at step " + std::to_string(step) + "\"";
+        impl_->cache_valid = false;
         return false;
       }
     }
@@ -272,6 +326,12 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
       if (attempt == 3) PRESTO_LOG_WARN("llamacpp", "detokenize kept failing; text omitted");
     }
   }
+
+  // memory now holds prompt+generated; publish it as reusable history
+  impl_->cache_tokens = prompt;
+  impl_->cache_tokens.insert(impl_->cache_tokens.end(), out_tokens.begin(),
+                             out_tokens.end());
+  impl_->cache_valid = true;
 
   r.tokens.assign(out_tokens.begin(), out_tokens.end());
   r.tok_per_sec =
