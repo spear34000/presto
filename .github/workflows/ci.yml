@@ -23,6 +23,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install CUDA toolkit (nvcc)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nvidia-cuda-toolkit
+          nvcc --version
+
       - name: Install Vulkan SDK (LunarG)
         run: |
           wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
@@ -44,8 +50,11 @@ jobs:
       - name: Configure (CUDA + Vulkan backends)
         run: |
           set -o pipefail
+          # single architecture keeps this compile gate fast; runtime builds
+          # on real machines pick their own arches
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DPRESTO_WITH_LLAMACPP=ON \
                 -DPRESTO_WITH_CUDA=ON -DPRESTO_WITH_VULKAN=ON -DPRESTO_BUILD_TESTS=OFF \
+                -DCMAKE_CUDA_ARCHITECTURES=80 \
                 2>&1 | tee logs/01-configure.log
 
       - name: Build presto (compile + link check for hw backends)
