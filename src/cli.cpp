@@ -12,6 +12,18 @@
 #include "backends/mlx_backend.hpp"
 #endif
 
+namespace presto {
+namespace {
+void note_draft_path(const std::string& p) {
+#ifdef PRESTO_WITH_LLAMACPP
+  set_spec_draft_path(p);
+#else
+  (void)p;
+#endif
+}
+} // namespace
+}
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -164,6 +176,7 @@ int cmd_run(const std::vector<std::string>& args) {
   int max_tokens = 32;
   float temp = 0.0f;
   long long seed = -1;
+  std::string draft_path;
 
   for (std::size_t i = 1; i < args.size(); ++i) {
     const std::string& a = args[i];
@@ -210,9 +223,15 @@ int cmd_run(const std::vector<std::string>& args) {
       }
       continue;
     }
+    if (a == "--draft" && i + 1 < args.size()) {
+      draft_path = args[++i];
+      continue;
+    }
     print_error_line("usage", "unknown option '" + a + "'");
     return kUsage;
   }
+
+  if (!draft_path.empty()) note_draft_path(draft_path);
 
   const Detection d = detect_format(model_path);
   if (d.format == ModelFormat::UNKNOWN) {
@@ -302,6 +321,10 @@ int cmd_bench(const std::vector<std::string>& args) {
     if (a == "--temp" && next_float(temp)) continue;
     if (a == "--prompt" && i + 1 < args.size()) {
       prompt = args[++i];
+      continue;
+    }
+    if (a == "--draft" && i + 1 < args.size()) {
+      note_draft_path(args[++i]);
       continue;
     }
     print_error_line("usage", "unknown bench option '" + a + "'");

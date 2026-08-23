@@ -67,21 +67,39 @@ Windows 11, Intel Arc 140V iGPU, stories15M-q4_0.gguf, 256 tokens x 5 runs:
 GPU offload is automatic: compile with `-DPRESTO_WITH_VULKAN=ON`, run the
 same command, and the model lands on whichever device is available.
 
-### Multi-model validation
-
-All models verified on one machine: format detection, greedy reproducibility
-(two identical invocations -> identical token ids) and decode tempo.
-
 | Model | Arch | Quant | Detect | Reproducible | tok/s (CPU x4) |
 |---|---|---|---|---|---|
 | stories260K.gguf            | llama  | F32  | ✅ | ✅ | 2498 (prestissimo) |
 | stories15M-q4_0.gguf        | llama  | Q4_0 | ✅ | ✅ | 1415 (prestissimo) |
 | SmolLM2-135M-Instruct-Q8_0  | llama  | Q8_0 | ✅ | ✅ | 191 (allegro) |
 | qwen2.5-0.5b-instruct-Q8_0  | qwen2  | Q8_0 | ✅ | ✅ | 81 (allegro) |
+| **Qwen3.5-9B-Instruct**     | **qwen35** | Q4_K_M | ✅ | ✅ | 7.1 (andante, ctx2048) |
 | SmolLM-135M-fp16 (MLX dir)  | llama  | F16  | ✅ | ✅ | macOS CI run |
 
 The `qwen2` row exercises a different architecture, GQA head ratios and tied
-embeddings through the same unified engine.
+embeddings through the same unified engine. The `qwen35` row proves the newest
+hybrid-attention generation loads and decodes correctly end-to-end.
+
+### Speculative decoding (--draft)
+
+`presto run model.gguf --draft small.gguf` implements greedy speculative
+decoding: a companion model proposes K tokens, the target verifies them in one
+batched pass. Outputs are **bit-identical** to the non-draft path (validated on
+SmolLM2 and Qwen3.5 pairs); when the target's KV cache cannot roll back
+rejected proposals (Qwen3.5 hybrid attention), presto detects it and falls
+back gracefully mid-request.
+
+Requirements for a speedup: draft must share the tokenizer AND be much
+smaller than the target (e.g. Qwen3.5-0.8B draft → 9B target). Equal-size
+drafts are measured slower and rejected by common sense.
+
+### Hardware notes (measured, not assumed)
+
+Intel Arc 140V iGPU via Vulkan currently decodes *slower* than this machine's
+CPU at both 135M (707 vs ~1400 peak) and 9B (1.4 vs 7.8 tok/s) scales -
+generic Vulkan kernels lose to Intel's own SYCL path on XMX. CUDA on discrete
+NVIDIA and HIP on AMD Radeon remain the recommended GPU routes there; the Arc
+result is documented as-is rather than hidden.
 
 ### Tuning knobs (all opt-in, measured)
 
