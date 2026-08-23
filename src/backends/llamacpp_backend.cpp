@@ -8,6 +8,7 @@
 
 #include "llama.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <chrono>
@@ -65,6 +66,8 @@ struct LlamaCppBackend::Impl {
   llama_context* ctx = nullptr;
   uint32_t n_ctx = 0;
   int32_t threads = 0;
+  ggml_threadpool_t tpool = nullptr;
+  ggml_threadpool_t tpool_batch = nullptr;
 
   // Prefix KV cache: token history currently resident in llama_memory.
   // A new prompt sharing this prefix skips prefill for the shared part -
@@ -78,6 +81,8 @@ LlamaCppBackend::LlamaCppBackend(std::string path) : path_(std::move(path)) {}
 LlamaCppBackend::~LlamaCppBackend() {
   if (impl_) {
     if (impl_->ctx) llama_free(impl_->ctx);
+    if (impl_->tpool_batch) ggml_threadpool_free(impl_->tpool_batch);
+    if (impl_->tpool) ggml_threadpool_free(impl_->tpool);
     if (impl_->model) llama_model_free(impl_->model);
     llama_backend_free();
   }
@@ -133,10 +138,53 @@ bool LlamaCppBackend::load(std::string& err) {
   cparams.n_threads = impl_->threads;
   cparams.n_threads_batch = impl_->threads;
 
+  // Flash Attention: opt-in via PRESTO_FLASH_ATTN=1. Default stays AUTO -
+  // forced FA measured slower than the naive path on some small models.
+  if (env_int("PRESTO_FLASH_ATTN", 0) != 0) {
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+  }
+
+  // Optional KV-cache quantization: PRESTO_KV=q8_0|q4_0 trades a little
+  // quality for lower memory bandwidth on decode (needs FA for V quant).
+  if (const char* kv = std::getenv("PRESTO_KV"); kv && *kv) {
+    const std::string s(kv);
+    if (s == "q8_0") {
+      cparams.type_k = GGML_TYPE_Q8_0;
+      if (cparams.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED)
+        cparams.type_v = GGML_TYPE_Q8_0;
+    } else if (s == "q4_0") {
+      cparams.type_k = GGML_TYPE_Q4_0;
+      if (cparams.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED)
+        cparams.type_v = GGML_TYPE_Q4_0;
+    }
+    PRESTO_LOG_INFO("llamacpp", "kv cache dtype override: " + s);
+  }
+
   impl_->ctx = llama_init_from_model(impl_->model, cparams);
+  if (!impl_->ctx && cparams.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+    PRESTO_LOG_WARN("llamacpp", "flash attention rejected; retrying with auto");
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    impl_->ctx = llama_init_from_model(impl_->model, cparams);
+  }
   if (!impl_->ctx) {
     err = "step=create_context msg=\"llama_init_from_model failed\"";
     return false;
+  }
+
+  // Spinning threadpools are OPT-IN (PRESTO_POLL=100): they pin cores at
+  // 100% even while idle, which is ideal for latency-critical servers but
+  // hostile to anything else sharing the machine. Off by default.
+  if (env_int("PRESTO_POLL", 0) > 0 && !impl_->tpool) {
+    auto tp = ggml_threadpool_params_default(impl_->threads);
+    tp.poll = static_cast<uint32_t>(env_int("PRESTO_POLL", 0));
+    impl_->tpool = ggml_threadpool_new(&tp);
+    impl_->tpool_batch = ggml_threadpool_new(&tp);
+    if (impl_->tpool) {
+      llama_attach_threadpool(impl_->ctx, impl_->tpool, impl_->tpool_batch);
+      PRESTO_LOG_INFO("llamacpp", "spinning threadpool: " +
+                                      std::to_string(impl_->threads) + " threads, poll=" +
+                                      std::to_string(tp.poll));
+    }
   }
 
   // Warmup decode: pages in weights/compute buffers so the first real request
@@ -220,6 +268,9 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
     }
     impl_->n_ctx = grown;
     impl_->cache_valid = false;  // fresh memory: nothing resident to reuse
+    if (impl_->tpool) {
+      llama_attach_threadpool(impl_->ctx, impl_->tpool, impl_->tpool_batch);
+    }
   }
 
   // ---- prefix-cache aware prefill ----

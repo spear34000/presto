@@ -67,6 +67,32 @@ Windows 11, Intel Arc 140V iGPU, stories15M-q4_0.gguf, 256 tokens x 5 runs:
 GPU offload is automatic: compile with `-DPRESTO_WITH_VULKAN=ON`, run the
 same command, and the model lands on whichever device is available.
 
+### Multi-model validation
+
+All models verified on one machine: format detection, greedy reproducibility
+(two identical invocations -> identical token ids) and decode tempo.
+
+| Model | Arch | Quant | Detect | Reproducible | tok/s (CPU x4) |
+|---|---|---|---|---|---|
+| stories260K.gguf            | llama  | F32  | ✅ | ✅ | 2498 (prestissimo) |
+| stories15M-q4_0.gguf        | llama  | Q4_0 | ✅ | ✅ | 1415 (prestissimo) |
+| SmolLM2-135M-Instruct-Q8_0  | llama  | Q8_0 | ✅ | ✅ | 191 (allegro) |
+| qwen2.5-0.5b-instruct-Q8_0  | qwen2  | Q8_0 | ✅ | ✅ | 81 (allegro) |
+| SmolLM-135M-fp16 (MLX dir)  | llama  | F16  | ✅ | ✅ | macOS CI run |
+
+The `qwen2` row exercises a different architecture, GQA head ratios and tied
+embeddings through the same unified engine.
+
+### Tuning knobs (all opt-in, measured)
+
+| Env | Default | Effect |
+|---|---|---|
+| `PRESTO_PREFIX_CACHE` | on | reuse KV across shared-prefix requests (97% prefill skip measured); outputs bit-identical when off |
+| `PRESTO_FLASH_ATTN=1` | off | force Flash Attention kernels (A/B: slower on some small models) |
+| `PRESTO_POLL=100` | off | spinning threadpools: lowest latency for dedicated servers; pins cores while idle |
+| `PRESTO_KV=q8_0` | fp16 | KV quantization for memory-bound decode |
+| `PRESTO_THREADS` / `PRESTO_CTX` / `PRESTO_GPU_LAYERS` | auto | thread count / context size / layer offload |
+
 CI enforces tempo floors so a regression fails the build:
 windows `med_tps >= 100`, macOS Metal `med_tps >= 20` (calibrated against
 the measured 29.5 tok/s of stories260K on an M1 runner).
