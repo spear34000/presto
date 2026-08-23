@@ -41,6 +41,19 @@ temperature 0:
 Same kernels as llama.cpp (we link it) with zero serving overhead; ollama's
 daemon+HTTP stack costs ~40% of throughput at this scale.
 
+### vs HuggingFace Transformers (the world's default runtime)
+
+Same machine, greedy decode, fp32 (transformers' own CPU default) vs
+presto Q8_0 GGUF - i.e. the standard "quantized runtime vs reference
+implementation" deployment comparison:
+
+| Model | HF Transformers | presto | Speedup |
+|---|---|---|---|
+| SmolLM2-135M-Instruct | 30.9 tok/s | **191**   | **6.2x** |
+| Qwen2.5-0.5B-Instruct | 18.0 tok/s | **81.3**  | **4.5x** |
+
+Reproduce the HF side anywhere: `python scripts/bench_hf.py <model> --steps 64`.
+
 ### Prefix KV cache (SGLang RadixAttention idea)
 
 Consecutive requests sharing token history skip re-prefill entirely -
