@@ -116,6 +116,17 @@ PRESTO_TEST(detect_mlx_dir) {
   std::filesystem::remove_all(dir);
 }
 
+PRESTO_TEST(detect_unquantized_mlx_dir) {
+  const auto dir = make_fixture_dir();
+  write_text(dir / "config.json",
+             R"({"model_type":"llama","hidden_size":32,"vocab_size":128})");
+  write_bytes(dir / "model.safetensors", minimal_safetensors());
+  const Detection d = detect_format(dir.string());
+  PRESTO_EXPECT(d.format == presto::ModelFormat::MLX_DIR);
+  PRESTO_EXPECT(d.meta.at("quantization_style") == "none");
+  std::filesystem::remove_all(dir);
+}
+
 PRESTO_TEST(detect_plain_hf_dir_is_unknown) {
   const auto dir = make_fixture_dir();
   write_text(dir / "config.json", R"({"model_type":"llama","hidden_size":4096})");

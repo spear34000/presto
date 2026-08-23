@@ -23,16 +23,23 @@ echo "::endgroup::"
 MODEL_DIR=""
 
 echo "::group::[smoke-mlx] stage A: real model $REAL_MODEL"
-if python3 - <<'PY'
+# Single snapshot call with explicit allow_patterns: requesting only what we
+# need keeps huggingface_hub's completeness check satisfied.
+MODEL_DIR=$(python3 - "$REAL_MODEL" <<'PY'
+import sys
 from huggingface_hub import snapshot_download
-p = snapshot_download(
-    "mlx-community/SmolLM-135M-fp16",
-    allow_patterns=["*.json", "*.safetensors"],
-)
-print("downloaded to", p)
+try:
+    p = snapshot_download(
+        sys.argv[1],
+        allow_patterns=["*.json", "*.safetensors"],
+    )
+    print(p)
+except Exception as e:
+    print(f"download failed: {e}", file=sys.stderr)
+    sys.exit(1)
 PY
-then
-    MODEL_DIR=$(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download('mlx-community/SmolLM-135M-fp16', local_files_only=True))")
+)
+if [ -n "$MODEL_DIR" ]; then
     echo "[smoke-mlx] stage A model dir: $MODEL_DIR"
 else
     echo "[smoke-mlx] stage A download failed; will use fallback"

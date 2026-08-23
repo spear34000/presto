@@ -167,6 +167,29 @@ Detection detect_dir(const std::string& path) {
     }
   }
 
+  // Unquantized mlx-lm conversions carry no "quantization" key; their layout
+  // is config.json + safetensors shards with HF weight names, which is also
+  // exactly what the mlx backend executes.
+  bool has_weights = false;
+  for (const auto& entry : fs::directory_iterator(fs::path(path), ec)) {
+    if (!entry.is_regular_file()) continue;
+    const std::string name = entry.path().filename().string();
+    const auto ends_with_st = [&]() {
+      return name.size() >= 12 &&
+             name.compare(name.size() - 12, 12, ".safetensors") == 0;
+    };
+    if (ends_with_st() || ends_with_any(name, {".npz"})) {
+      has_weights = true;
+      break;
+    }
+  }
+  if (has_weights) {
+    d.format = ModelFormat::MLX_DIR;
+    d.meta["quantization_style"] = "none";
+    d.summary = "MLX-layout directory (unquantized safetensors)";
+    return d;
+  }
+
   d.format = ModelFormat::UNKNOWN;
   d.summary = "HF-style directory (fp safetensors/pytorch weights); execution roadmap";
   return d;
