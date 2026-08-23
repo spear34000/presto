@@ -356,12 +356,18 @@ bool MlxBackend::generate(const GenerateParams& gp, GenerateResult& r, std::stri
         return true;
       return n == "lm_head.weight";
     };
+    // mlx::core::array has no default constructor, so the map cannot use
+    // operator[]; insert_or_assign keeps construction explicit.
     std::unordered_map<std::string, mx::array> W;
     W.reserve(I.weights.size());
     for (const auto& [name, t] : I.weights) {
       mx::Shape shp(t.shape.begin(), t.shape.end());
       mx::array a(t.data.data(), shp);
-      W[name] = needs_transpose(name) ? mx::transpose(a) : a;
+      if (needs_transpose(name)) {
+        W.insert_or_assign(name, mx::transpose(a));
+      } else {
+        W.insert_or_assign(name, std::move(a));
+      }
     }
 
     const mx::array& embed = W.at("model.embed_tokens.weight");
