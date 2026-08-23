@@ -1,217 +1,176 @@
-# presto 🎶
+<div align="center">
 
-> **presto** /ˈprɛs.to/ - Italian musical term: *very fast* (172-208 BPM).
-> A unified LLM inference runtime that takes the marking seriously.
+# 🎼 presto
 
-One static C++ binary that inspects every major model format, executes GGUF and
-MLX natively, and runs on whatever silicon you have: NVIDIA, AMD Radeon,
-Intel iGPU/Arc via Vulkan, Apple Silicon via Metal and MLX, or plain x86 CPU.
+### Unified LLM inference in C/C++
 
-## Why presto (tempo = tokens)
+**presto** (*Italian*: "very fast", 172–208 BPM) takes its tempo marking seriously.
 
-Built by surveying the most popular open-source runtimes (stars verified 2026-08)
-and absorbing the best idea of each:
+[![ci](https://github.com/spear34000/presto/actions/workflows/ci.yml/badge.svg)](https://github.com/spear34000/presto/actions/workflows/ci.yml)
+![license](https://img.shields.io/github/license/spear34000/presto)
+![C++](https://img.shields.io/badge/C%2B%2B-20-blue)
+![platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 
-| # | Runtime | Stars | Idea presto absorbs |
-|---|---------|-------|---------------------|
-| 1 | [ollama](https://github.com/ollama/ollama) | ~179k | one-command UX + OpenAI-compatible server |
+[About](#about) · [Quick start](#quick-start) · [Performance](#performance) · [Models](#supported-models) · [Hardware](#hardware) · [Build](#build) · [CI](#continuous-integration)
+
+</div>
+
+---
+
+## About
+
+One static binary that **inspects every major model format**, **executes GGUF
+and MLX natively**, speaks the **OpenAI API**, and runs on whatever silicon
+you have - NVIDIA, AMD Radeon, Intel iGPU/Arc, Apple Silicon, or plain x86.
+
+Built by surveying the most popular open-source runtimes (stars verified
+2026-08) and absorbing the best idea of each:
+
+| # | Runtime | Stars | Idea absorbed |
+|---|---|---|---|
+| 1 | [ollama](https://github.com/ollama/ollama) | ~179k | pull-and-run UX, OpenAI-compatible server |
 | 2 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | ~125k | native GGUF execution, broadest hardware |
-| 3 | [vLLM](https://github.com/vllm-project/vllm) | ~90k | OpenAI `/v1/*` API surface |
-| 4 | [SGLang](https://github.com/sgl-project/sglang) | ~32k | (roadmap: prefix caching) |
-| 5 | [MLX](https://github.com/ml-explore/mlx) / mlx-lm | ~28k | Apple-Silicon-native weight format |
+| 3 | [vLLM](https://github.com/vllm-project/vllm) | ~90k | `/v1/*` API surface |
+| 4 | [SGLang](https://github.com/sgl-project/sglang) | ~32k | prefix KV-cache reuse (roadmap→done) |
+| 5 | [MLX](https://github.com/ml-explore/mlx) | ~28k | Apple-Silicon-native weight format |
 | 7 | [ktransformers](https://github.com/kvcache-ai/ktransformers) | ~19k | heterogeneous backend routing |
 
-## Tempo Report (measured, not promised)
+## Quick start
 
-Every build ships `presto bench`, which measures decode throughput across
-repeated runs and reports min/median/max and sigma. Stability is a feature:
-the sigma number IS the stability claim.
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel
 
-### Head-to-head on one machine
+./build/presto run model.gguf --prompt "Once upon a time" --max-tokens 64
+./build/presto serve model.gguf --port 8000      # OpenAI-compatible API
+./build/presto bench model.gguf --steps 128       # Tempo Report
+```
 
-Windows 11, Intel/AMD CPU 4 threads, stories15M-q4_0.gguf, 128-token decode,
-temperature 0:
+## Performance
 
-| Runtime | Median tok/s | Sigma | vs presto |
+All numbers measured on one machine (Windows 11, Lunar Lake CPU 4 threads /
+Intel Arc 140V), greedy decode, reported with min/median/max and sigma via the
+built-in `presto bench`.
+
+### Head-to-head
+
+| Runtime | Model | Median tok/s | vs presto |
 |---|---|---|---|
-| **presto** (`presto bench`)            | **1724** | ±2.8% | - |
-| llama.cpp stock (`llama-bench` tg128)  | 1720     | ±3.6% | 1.00x |
-| ollama 0.32.15 (`/api/generate`)       | 1016     | n/a   | **1.70x faster** |
+| **presto**                    | stories15M Q4_0 | **1724** ± 2.8% | - |
+| llama.cpp stock (`llama-bench`) | stories15M Q4_0 | 1720 ± 3.6%   | 1.00x |
+| ollama 0.32.15                | stories15M Q4_0 | 1016           | **1.70x faster** |
 
-Same kernels as llama.cpp (we link it) with zero serving overhead; ollama's
-daemon+HTTP stack costs ~40% of throughput at this scale.
+### vs HuggingFace Transformers
 
-### vs HuggingFace Transformers (the world's default runtime)
-
-Same machine, greedy decode, fp32 (transformers' own CPU default) vs
-presto Q8_0 GGUF - i.e. the standard "quantized runtime vs reference
-implementation" deployment comparison:
+fp32 reference (transformers' own CPU default) vs presto Q8_0 - the standard
+quantized-runtime deployment comparison:
 
 | Model | HF Transformers | presto | Speedup |
 |---|---|---|---|
 | SmolLM2-135M-Instruct | 30.9 tok/s | **191**   | **6.2x** |
-| Qwen2.5-0.5B-Instruct | 18.0 tok/s | **81.3**  | **4.5x** |
+| Qwen2.5-0.5B-Instruct | 18.0 tok/s | **81.3** | **4.5x** |
 
-Reproduce the HF side anywhere: `python scripts/bench_hf.py <model> --steps 64`.
+Reproduce the HF side anywhere: `python scripts/bench_hf.py <model> --steps 64`
 
-### Prefix KV cache (SGLang RadixAttention idea)
+### Prefix KV cache
 
 Consecutive requests sharing token history skip re-prefill entirely -
-multi-turn chat, agent loops and fixed system prompts get near-zero
-time-to-first-token on the shared part. Measured in-process on
-stories15M-q4_0 (serve mode):
+multi-turn chat and fixed system prompts get near-zero time-to-first-token
+on the shared part (**97% of prompt tokens skipped** measured), with outputs
+bit-identical to the uncached path.
 
-```
-prefix reuse: kept 385/398 tokens    <- 97% of prompt prefill skipped
-```
+### Speculative decoding
 
-Greedy outputs are byte-identical with `PRESTO_PREFIX_CACHE=0`, so the
-speedup is free of behavioral change.
+`--draft small.gguf` implements greedy speculative decoding whose outputs are
+**bit-identical** to the plain path (validated on SmolLM2 and Qwen3.5 pairs).
+Architectures whose KV cache cannot roll back proposals (Qwen3.5 hybrid
+attention) fall back gracefully mid-request instead of failing.
 
-### GPU offload
+## Supported models
 
-Windows 11, Intel Arc 140V iGPU, stories15M-q4_0.gguf, 256 tokens x 5 runs:
+| Format | Inspect (`info`) | Execute |
+|---|---|---|
+| GGUF `.gguf`                 | full metadata parse (pure C++) | ✅ llama.cpp backend |
+| MLX dir (mlx-lm layout)      | config + quantization detection | ✅ mlx core backend (Apple Silicon) |
+| SafeTensors `.safetensors`   | tensor inventory + dtype histogram | roadmap |
+| PyTorch `.pt/.pth/.ckpt`     | zip container detection | roadmap |
+| AWQ dirs                     | bits / group_size extraction | roadmap |
+| GPTQ dirs                    | quant_method extraction | roadmap |
 
-| Device | Median tok/s | Marking | Sigma |
-|---|---|---|---|
-| Intel Arc 140V (Vulkan offload) | **707.1** | presto | ±12.3% |
-| Same machine, CPU only          | 247.5   | presto | ±10.1% |
+Validated end-to-end across three architecture generations:
 
-GPU offload is automatic: compile with `-DPRESTO_WITH_VULKAN=ON`, run the
-same command, and the model lands on whichever device is available.
-
-| Model | Arch | Quant | Detect | Reproducible | tok/s (CPU x4) |
+| Model | Arch | Quant | Detect | Reproduce | tok/s (CPU x4) |
 |---|---|---|---|---|---|
-| stories260K.gguf            | llama  | F32  | ✅ | ✅ | 2498 (prestissimo) |
-| stories15M-q4_0.gguf        | llama  | Q4_0 | ✅ | ✅ | 1415 (prestissimo) |
-| SmolLM2-135M-Instruct-Q8_0  | llama  | Q8_0 | ✅ | ✅ | 191 (allegro) |
-| qwen2.5-0.5b-instruct-Q8_0  | qwen2  | Q8_0 | ✅ | ✅ | 81 (allegro) |
-| **Qwen3.5-9B-Instruct**     | **qwen35** | Q4_K_M | ✅ | ✅ | 7.1 (andante, ctx2048) |
-| SmolLM-135M-fp16 (MLX dir)  | llama  | F16  | ✅ | ✅ | macOS CI run |
+| stories260K                  | llama  | F32    | ✅ | ✅ | 2498 |
+| stories15M-q4_0              | llama  | Q4_0   | ✅ | ✅ | 1415 |
+| SmolLM2-135M-Instruct        | llama  | Q8_0   | ✅ | ✅ | 191  |
+| qwen2.5-0.5b-instruct        | qwen2  | Q8_0   | ✅ | ✅ | 81   |
+| **Qwen3.5-9B-Instruct**      | **qwen35** | Q4_K_M | ✅ | ✅ | 7.1  |
+| SmolLM-135M-fp16 (MLX)       | llama  | F16    | ✅ | ✅ | macOS CI |
 
-The `qwen2` row exercises a different architecture, GQA head ratios and tied
-embeddings through the same unified engine. The `qwen35` row proves the newest
-hybrid-attention generation loads and decodes correctly end-to-end.
+## Hardware
 
-### Speculative decoding (--draft)
-
-`presto run model.gguf --draft small.gguf` implements greedy speculative
-decoding: a companion model proposes K tokens, the target verifies them in one
-batched pass. Outputs are **bit-identical** to the non-draft path (validated on
-SmolLM2 and Qwen3.5 pairs); when the target's KV cache cannot roll back
-rejected proposals (Qwen3.5 hybrid attention), presto detects it and falls
-back gracefully mid-request.
-
-Requirements for a speedup: draft must share the tokenizer AND be much
-smaller than the target (e.g. Qwen3.5-0.8B draft → 9B target). Equal-size
-drafts are measured slower and rejected by common sense.
-
-### Hardware notes (measured, not assumed)
-
-Intel Arc 140V iGPU via Vulkan currently decodes *slower* than this machine's
-CPU at both 135M (707 vs ~1400 peak) and 9B (1.4 vs 7.8 tok/s) scales -
-generic Vulkan kernels lose to Intel's own SYCL path on XMX. CUDA on discrete
-NVIDIA and HIP on AMD Radeon remain the recommended GPU routes there; the Arc
-result is documented as-is rather than hidden.
-
-### Tuning knobs (all opt-in, measured)
-
-| Env | Default | Effect |
-|---|---|---|
-| `PRESTO_PREFIX_CACHE` | on | reuse KV across shared-prefix requests (97% prefill skip measured); outputs bit-identical when off |
-| `PRESTO_FLASH_ATTN=1` | off | force Flash Attention kernels (A/B: slower on some small models) |
-| `PRESTO_POLL=100` | off | spinning threadpools: lowest latency for dedicated servers; pins cores while idle |
-| `PRESTO_KV=q8_0` | fp16 | KV quantization for memory-bound decode |
-| `PRESTO_THREADS` / `PRESTO_CTX` / `PRESTO_GPU_LAYERS` | auto | thread count / context size / layer offload |
-
-CI enforces tempo floors so a regression fails the build:
-windows `med_tps >= 100`, macOS Metal `med_tps >= 20` (calibrated against
-the measured 29.5 tok/s of stories260K on an M1 runner).
-
-## Hardware support
-
-| Hardware | Path | Build flag | Status |
+| Hardware | Route | Flag | Status |
 |---|---|---|---|
-| NVIDIA (discrete)      | CUDA   | `-DPRESTO_WITH_CUDA=ON`   | CI-verified builds; runtime needs NVIDIA GPU |
-| NVIDIA / AMD / Intel   | Vulkan | `-DPRESTO_WITH_VULKAN=ON` | **runtime-verified on Intel Arc 140V** |
-| AMD Radeon (Linux)     | HIP    | `-DPRESTO_WITH_HIP=ON`    | builds; runtime needs ROCm device |
-| Apple Silicon          | Metal + MLX | auto ON on macOS     | CI runtime-verified every push |
-| x86 CPU (Intel/AMD)    | ggml CPU (AVX dispatch) | default  | always available |
+| NVIDIA discrete            | CUDA   | `-DPRESTO_WITH_CUDA=ON`   | CI build gate |
+| NVIDIA / AMD / Intel       | Vulkan | `-DPRESTO_WITH_VULKAN=ON` | runtime-verified (Arc 140V) |
+| AMD Radeon (Linux)         | HIP    | `-DPRESTO_WITH_HIP=ON`    | flag available |
+| Intel Arc (XMX)            | SYCL   | `-DPRESTO_WITH_SYCL=ON`   | flag available (oneAPI) |
+| Apple Silicon              | Metal + MLX | auto ON on macOS      | runtime-verified every push |
+| x86 CPU (Intel/AMD)        | ggml CPU | default                  | always |
 
-Control layer offload with `PRESTO_GPU_LAYERS` (`-1` = auto/max, `0` = CPU-only,
-N = exact layers).
-
-## Format support
-
-| Format | Inspect (`presto info`) | Execute |
-|---|---|---|
-| GGUF (`.gguf`)            | full metadata parse (pure C++)      | YES - llama.cpp backend |
-| MLX dir (mlx-lm layout)   | config + quantization detection     | YES - mlx core backend (Apple Silicon), token-id level |
-| SafeTensors (`.safetensors`) | tensor inventory + dtype histogram | roadmap (convert to GGUF/MLX) |
-| PyTorch (`.pt`/`.pth`/`.ckpt`) | zip container detection        | roadmap (conversion pipeline) |
-| AWQ dirs                  | bits / group_size extraction        | roadmap |
-| GPTQ dirs                 | quant_method / bits extraction      | roadmap |
+Layer offload control: `PRESTO_GPU_LAYERS` (`-1` auto/max, `0` CPU-only).
 
 ## Build
 
 ```bash
-# baseline: CPU only
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release --parallel
+# Linux / macOS
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release --parallel
 
-# your GPU: add one flag
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DPRESTO_WITH_VULKAN=ON   # NVIDIA/AMD/Intel
-# cmake -B build ... -DPRESTO_WITH_CUDA=ON                          # NVIDIA
-# cmake -B build ... -DPRESTO_WITH_HIP=ON                           # AMD ROCm
-cmake --build build --config Release --parallel
+# Windows (MSVC)
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release --parallel
 
-# core-only (no network-heavy deps)
-cmake -B build-core -DPRESTO_WITH_LLAMACPP=OFF && cmake --build build-core --config Release --parallel
+# GPU backends: add ONE flag
+#   -DPRESTO_WITH_CUDA=ON | -DPRESTO_WITH_VULKAN=ON | -DPRESTO_WITH_HIP=ON
+# Intel SYCL additionally requires oneAPI env (scripts/build_sycl.bat on Windows)
+
+# core-only, zero heavy deps
+cmake -B build-core -DPRESTO_WITH_LLAMACPP=OFF && cmake --build build-core --parallel
 ```
 
-Dependencies are FetchContent'd and pinned: llama.cpp `b21e4de74...`,
-cpp-httplib v0.15.3, MLX v0.32.1. Requires CMake >= 3.24, C++20.
+Pinned dependencies via FetchContent: llama.cpp `b21e4de74`, cpp-httplib
+v0.15.3, MLX v0.32.1.
 
 ## Usage
 
-```bash
-./build/presto version                  # capability report incl. hw backends
-./build/presto info model.gguf          # deep inspection of ANY supported format
-
-./build/presto run model.gguf --prompt "Once upon a time" --max-tokens 64 --temp 0.8
-
-./build/presto bench model.gguf --steps 128 --runs 5     # Tempo Report
-./build/presto serve model.gguf --port 8000              # OpenAI-compatible API
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -d '{"messages":[{"role":"user","content":"hello"}]}'
+```text
+presto info   <model>                          # deep inspection, ANY format
+presto run    <model> [--prompt "..."] [--draft small.gguf]
+                      [--max-tokens N] [--temp F] [--seed N]
+presto serve  <model> [--host H] [--port P]    # /v1/chat/completions
+presto bench  <model> [--steps N] [--runs N]    # Tempo Report (min/med/max/σ)
+presto version                                   # capability report
 ```
 
-Env: `PRESTO_THREADS` (inference threads) · `PRESTO_CTX` (context size) ·
-`PRESTO_GPU_LAYERS` (offload control) · `PRESTO_LOG` · `PRESTO_SMOKE=1`.
+Environment: `PRESTO_THREADS` `PRESTO_CTX` `PRESTO_GPU_LAYERS`
+`PRESTO_PREFIX_CACHE` `PRESTO_FLASH_ATTN` `PRESTO_POLL` `PRESTO_KV`
+`PRESTO_SPEC_K` `PRESTO_LOG` `PRESTO_SMOKE`
 
-Exit codes: `0` ok · `2` usage · `3` unsupported format · `4` backend unavailable · `5` failure.
+Exit codes: `0` ok · `2` usage · `3` unsupported format · `4` backend
+unavailable · `5` failure.
 
-## Tests
+## Continuous integration
 
-Zero-dependency unit tests (18 cases): JSON parser, GGUF header parser,
-safetensors parser, format detection, backend routing.
-
-```bash
-cmake --build build --config Release && ./build/presto_tests   # ALL TESTS PASSED
-```
-
-## CI
+Every push runs four jobs; failures always upload full stage logs as
+artifacts, and throughput regressions fail the build through calibrated
+tempo gates.
 
 | Job | Runner | Verifies |
-|-----|--------|----------|
-| `ubuntu-core` | ubuntu-latest | core-only build + unit tests (fast gate) |
-| `linux-hw-build` | ubuntu-latest | CUDA + Vulkan toolchains compile & link |
-| `windows-gguf` | windows-latest | MSVC + llama.cpp + real generation + tempo gate |
-| `macos-mlx` | macos-15 (arm64) | real MLX weights generate tokens + Metal GGUF + tempo gate |
-
-Failures always upload `logs-*` artifacts (configure/build/test/smoke/bench logs +
-environment info); smoke and bench emit `[presto-smoke]` / `[presto-bench]` markers,
-so one log line identifies the failing stage.
+|---|---|---|
+| ubuntu-core | ubuntu-latest | core build + unit tests |
+| linux-hw-build | ubuntu-latest | CUDA + Vulkan toolchains compile & link |
+| windows-gguf | windows-latest | MSVC + real generation + tempo gate |
+| macos-mlx | macos-15 | real MLX weights generate + Metal GGUF + tempo gate |
 
 ## License
 
