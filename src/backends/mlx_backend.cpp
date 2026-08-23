@@ -338,8 +338,6 @@ bool MlxBackend::generate(const GenerateParams& gp, GenerateResult& r, std::stri
   const int nh = I.num_heads;
   const int nkv = I.num_kv_heads;
   const int dh = H / nh;
-  const bool use_separate_lm_head =
-      !I.tied_embeddings && I.weights.count("lm_head.weight") != 0;
 
   std::vector<std::int32_t> kv_idx;
   kv_idx.reserve(static_cast<std::size_t>(nh));
@@ -372,6 +370,13 @@ bool MlxBackend::generate(const GenerateParams& gp, GenerateResult& r, std::stri
 
     const mx::array& embed = W.at("model.embed_tokens.weight");
     const mx::array& norm_w = W.at("model.norm.weight");
+    // Tied embeddings reuse the [V,H] embedding as lm_head, which must be
+    // [in,out] = [H,V] for the final matmul.
+    const bool use_separate_lm_head =
+        !I.tied_embeddings && W.count("lm_head.weight") != 0;
+    const mx::array lm_weights =
+        use_separate_lm_head ? W.at("lm_head.weight")
+                             : mx::transpose(W.at("model.embed_tokens.weight"));
 
     const auto gen_t0 = std::chrono::steady_clock::now();
     std::vector<int> out_tokens;
@@ -460,8 +465,7 @@ bool MlxBackend::generate(const GenerateParams& gp, GenerateResult& r, std::stri
         x = mx::add(x, mlp);
       }
       x = rms_norm(x, norm_w, I.rms_eps);
-      mx::array logits =
-          use_separate_lm_head ? mx::matmul(x, W.at("lm_head.weight")) : mx::matmul(x, embed);
+      mx::array logits = mx::matmul(x, lm_weights);
       mx::eval(logits);
 
       const mx::array last_row = mx::reshape(
