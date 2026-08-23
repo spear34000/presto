@@ -428,15 +428,23 @@ bool MlxBackend::generate(const GenerateParams& gp, GenerateResult& r, std::stri
         const mx::array v =
             mx::reshape(mx::matmul(h, wt("self_attn.v_proj.weight")), {T, nkv, dh});
 
-        const mx::array kv_index = mx::array(kv_idx.data(), {nh});
-        const mx::array k_rep = mx::take(k, kv_index, 1);
-        const mx::array v_rep = mx::take(v, kv_index, 1);
+        // move head axis forward for batched-over-heads matmuls:
+        //   q -> [nh, T, dh], k/v -> [nh, T, dh] after GQA expansion
+        const mx::array qt = mx::transpose(q, {1, 0, 2});
+        mx::array kt = mx::transpose(k, {1, 0, 2});
+        mx::array vt = mx::transpose(v, {1, 0, 2});
 
-        mx::array scores = mx::matmul(q, mx::transpose(k_rep, {0, 2, 1}));
+        const mx::array kv_index = mx::array(kv_idx.data(), {nh});
+        kt = mx::take(kt, kv_index, 0);
+        vt = mx::take(vt, kv_index, 0);
+
+        // scores [nh, T_q, T_k]
+        mx::array scores = mx::matmul(qt, mx::transpose(kt, {0, 2, 1}));
         scores = mx::divide(scores, mx::array(std::sqrt(static_cast<double>(dh))));
-        scores = mx::add(scores, mask);
+        scores = mx::add(scores, mask);  // mask [1, T, T] broadcasts over heads
         const mx::array probs = mx::softmax(scores, -1);
-        mx::array attn = mx::matmul(probs, v_rep);  // [T,nh,dh]
+        mx::array attn = mx::matmul(probs, vt);  // [nh, T, dh]
+        attn = mx::transpose(attn, {1, 0, 2});   // [T, nh, dh]
         attn = mx::reshape(attn, {T, H});
         attn = mx::matmul(attn, wt("self_attn.o_proj.weight"));
         x = mx::add(x, attn);
