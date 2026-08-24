@@ -3,6 +3,7 @@
 #include "presto/engine.hpp"
 #include "presto/format.hpp"
 #include "presto/log.hpp"
+#include "presto/resolve.hpp"
 #include "presto/server.hpp"
 
 #ifdef PRESTO_WITH_LLAMACPP
@@ -161,7 +162,7 @@ int cmd_info(const std::vector<std::string>& args) {
     print_usage(stderr);
     return kUsage;
   }
-  const Detection d = detect_format(args[0]);
+  const Detection d = detect_format(resolve_model_path(args[0]));
   std::printf("path   : %s\n", d.path.c_str());
   std::printf("format : %s\n", format_name(d.format));
   std::printf("summary: %s\n", d.summary.c_str());
@@ -238,7 +239,7 @@ int cmd_run(const std::vector<std::string>& args) {
 
   if (!draft_path.empty()) note_draft_path(draft_path);
 
-  const Detection d = detect_format(model_path);
+  const Detection d = detect_format(resolve_model_path(model_path));
   if (d.format == ModelFormat::UNKNOWN) {
     print_error_line("detect", d.summary);
     return kUnsupportedFormat;
@@ -339,7 +340,7 @@ int cmd_bench(const std::vector<std::string>& args) {
   warmup = std::max(0, std::min(warmup, 64));
   runs = std::max(1, std::min(runs, 64));
 
-  const Detection d = detect_format(model_path);
+  const Detection d = detect_format(resolve_model_path(model_path));
   if (d.format == ModelFormat::UNKNOWN) {
     print_error_line("detect", d.summary);
     return kUnsupportedFormat;
@@ -430,6 +431,10 @@ int main(int argc, char** argv) {
 
   try {
     if (cmd == "version") return cmd_version();
+    if (cmd == "models") {
+      for (const auto& p : list_known_models()) std::printf("%s\n", p.c_str());
+      return kOk;
+    }
     if (cmd == "info") return cmd_info({argv + 2, argv + argc});
     if (cmd == "run") return cmd_run({argv + 2, argv + argc});
     if (cmd == "bench") return cmd_bench({argv + 2, argv + argc});
@@ -455,7 +460,7 @@ int main(int argc, char** argv) {
           return kUsage;
         }
       }
-      const Detection d = detect_format(args[0]);
+      const Detection d = detect_format(resolve_model_path(args[0]));
       if (d.format == ModelFormat::UNKNOWN) {
         print_error_line("detect", d.summary);
         return kUnsupportedFormat;

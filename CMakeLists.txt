@@ -101,6 +101,7 @@ add_executable(presto
     src/detector.cpp
     src/engine.cpp
     src/gguf_meta.cpp
+    src/resolve.cpp
     src/server_http.cpp
     src/st_meta.cpp)
 
