@@ -50,6 +50,10 @@ cmake --build build --config Release --parallel
 ./build/presto bench model.gguf --steps 128       # Tempo Report
 ```
 
+<p align="center">
+  <img src="assets/demo.gif" width="720" alt="presto CLI demo"/>
+</p>
+
 ## Performance
 
 All numbers measured on one machine (Windows 11, Lunar Lake CPU 4 threads /
@@ -93,8 +97,14 @@ variables for full manual control.
 
 ### Speculative decoding
 
-`--draft small.gguf` implements greedy speculative decoding whose outputs are
-**bit-identical** to the plain path (validated on SmolLM2 and Qwen3.5 pairs).
+Zero-config by default: greedy decode automatically uses **prompt-lookup
+speculation** - n-gram spans copied from the prompt and verified in one
+target pass. Outputs are **bit-identical** to the plain path on any model;
+no draft download, no flags. Copy-heavy workloads (summarize, RAG,
+code-edit) measured **+27-51% tok/s** on Qwen2.5-0.5B.
+
+`--draft small.gguf` upgrades the proposer to a small companion model
+(same bit-identical guarantee, validated on SmolLM2 and Qwen3.5 pairs).
 Architectures whose KV cache cannot roll back proposals (Qwen3.5 hybrid
 attention) fall back gracefully mid-request instead of failing.
 
@@ -109,16 +119,25 @@ attention) fall back gracefully mid-request instead of failing.
 | AWQ dirs                     | bits / group_size extraction | roadmap |
 | GPTQ dirs                    | quant_method extraction | roadmap |
 
-Validated end-to-end across three architecture generations:
+| Model | Arch | Quant | Device | Detect | Repro | tok/s |
+|---|---|---|---|---|---|---|
+| stories260K                 | llama    | F32    | CPU    | OK | OK | 2498 |
+| stories15M-q4_0             | llama    | Q4_0   | CPU    | OK | OK | 1415 |
+| SmolLM2-135M-Instruct       | llama    | Q8_0   | CPU    | OK | OK | 191  |
+| qwen2.5-0.5b-instruct       | qwen2    | Q8_0   | CPU    | OK | OK | 81   |
+| phi-4                       | phi3     | Q4_K_M | CPU    | OK | OK | 3.0  |
+| Qwen3-8B (imatrix)          | qwen3    | Q4_K_M | CPU    | OK | OK | 4.9  |
+| Dolphin3.0-Llama3.1-8B      | llama    | Q4_K_S | CPU    | OK | OK | 5.8  |
+| Bonsai-27B                  | bonsai   | Q1_0   | CPU    | OK | OK | 2.4  |
+| gemma-4-E4B-it              | gemma4   | Q4_K_M | CPU    | OK | OK | 7.5  |
+| **gemma-4-26B-A4B-it**      | **gemma4** | Q3_K_M | **GPU** | OK | OK | **14.2** |
+| **gpt-oss-20b**             | **gpt-oss** | Q4_K_M | **GPU** | OK | OK | **21.7** |
+| Qwen3.5-9B-Instruct         | qwen35   | Q4_K_M | CPU/SYCL | OK | OK | 6.1 / **11.9** |
 
-| Model | Arch | Quant | Detect | Reproduce | tok/s (CPU x4) |
-|---|---|---|---|---|---|
-| stories260K                  | llama  | F32    | ✅ | ✅ | 2498 |
-| stories15M-q4_0              | llama  | Q4_0   | ✅ | ✅ | 1415 |
-| SmolLM2-135M-Instruct        | llama  | Q8_0   | ✅ | ✅ | 191  |
-| qwen2.5-0.5b-instruct        | qwen2  | Q8_0   | ✅ | ✅ | 81   |
-| **Qwen3.5-9B-Instruct**      | **qwen35** | Q4_K_M | ✅ | ✅ | 7.1  |
-| SmolLM-135M-fp16 (MLX)       | llama  | F16    | ✅ | ✅ | macOS CI |
+Every row: format detection, two identical invocations producing identical
+token ids, and a Tempo Report run. SYCL route for qwen35 measured with
+oneAPI 2026 on Arc 140V.
+
 
 ## Hardware
 

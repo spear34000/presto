@@ -540,22 +540,22 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
   llama_memory_t dmem = impl_->d_ctx ? llama_get_memory(impl_->d_ctx) : nullptr;
 
 
-  // Greedy + draft companion available -> speculative decoding. Outputs are
+  // Greedy -> speculative decoding. With a draft companion the proposer is
+  // the small model; without one it is n-gram prompt lookup. Outputs are
   // bit-identical to the loop below (greedy equivalence), just cheaper.
+  const bool want_spec = gp.temp <= 0.f && gp.max_tokens >= 4;
+  const bool lookup_eligible =
+      want_spec && !impl_->d_ctx &&
+      prompt.size() >= static_cast<size_t>(env_int("PRESTO_LOOKUP_MIN", 32));
   bool speculative = false;
   bool plain_fallback = false;
-  if (impl_->d_ctx && gp.temp <= 0.f && gp.max_tokens >= 4) {
+  if (want_spec && (impl_->d_ctx || lookup_eligible)) {
     speculative = true;
+    const bool have_draft = impl_->d_ctx != nullptr;
     const int Kmax = env_int("PRESTO_SPEC_K", 6);
+    const int lookup_seed = env_int("PRESTO_LOOKUP_N", 3);
     std::vector<llama_token> fed = prompt;  // exact mirror of target KV
 
-    auto draft_argmax_last = [&] {
-      const float* dl = llama_get_logits_ith(impl_->d_ctx, -1);
-      int best = 0;
-      for (int v = 1; v < n_vocab; ++v)
-        if (dl[v] > dl[best]) best = v;
-      return static_cast<llama_token>(best);
-    };
     auto target_argmax_row = [&](int row) {
       const float* lg = llama_get_logits_ith(impl_->ctx, row);
       int best = 0;
@@ -565,6 +565,7 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
     };
 
     // draft prefill: same prompt (v1 = full re-prefill per request)
+    if (have_draft) {
     llama_memory_clear(llama_get_memory(impl_->d_ctx), true);
     impl_->d_cache_tokens.clear();
     for (int32_t off = 0; off < static_cast<int32_t>(prompt.size());
@@ -581,10 +582,15 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
       }
     }
     if (!impl_->d_ctx) {
-      err = "step=spec msg=\"draft prefill failed\"";
-      return false;
-    }
+      speculative = false;
+    } else {
     impl_->d_cache_tokens = prompt;
+    }
+    }
+
+    if (speculative) {
+    PRESTO_LOG_INFO("llamacpp", std::string("speculative decoding ready: mode=") +
+                        (have_draft ? "draft-model" : "prompt-lookup"));
 
     // emit the target's first greedy token from the prefill logits, feeding
     // it into both models so every later round starts uniform.
@@ -601,16 +607,18 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
         impl_->cache_valid = false;
         return false;
       }
-      if (decode_single_at(impl_->d_ctx, first_tok,
-                           static_cast<llama_pos>(impl_->d_cache_tokens.size()))) {
-        err = "step=spec msg=\"draft first decode failed\"";
-        llama_free(impl_->d_ctx);
-        impl_->d_ctx = nullptr;
-        return false;
+      if (have_draft) {
+        if (decode_single_at(impl_->d_ctx, first_tok,
+                             static_cast<llama_pos>(impl_->d_cache_tokens.size()))) {
+          err = "step=spec msg=\"draft first decode failed\"";
+          llama_free(impl_->d_ctx);
+          impl_->d_ctx = nullptr;
+          return false;
+        }
       }
       out_tokens.push_back(first_tok);
       fed.push_back(first_tok);
-      impl_->d_cache_tokens.push_back(first_tok);
+      if (have_draft) impl_->d_cache_tokens.push_back(first_tok);
       pred_carry = target_argmax_row(-1);
     }
 
@@ -622,22 +630,68 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
 
       // --- draft proposals ---
       std::vector<llama_token> props;
-      llama_token dtok = draft_argmax_last();
-      while (static_cast<int>(props.size()) < K) {
-        if (llama_vocab_is_eog(impl_->vocab, dtok)) break;
-        props.push_back(dtok);
-        if (static_cast<int>(props.size()) >= K) break;
-        const llama_pos dpos =
-            static_cast<llama_pos>(impl_->d_cache_tokens.size());
-        if (decode_single_at(impl_->d_ctx, dtok, dpos)) break;
-        impl_->d_cache_tokens.push_back(dtok);
+      if (have_draft) {
+        const float* dl = llama_get_logits_ith(impl_->d_ctx, -1);
+        int best = 0;
+        for (int v = 1; v < n_vocab; ++v)
+          if (dl[v] > dl[best]) best = v;
+        llama_token dtok = static_cast<llama_token>(best);
+        while (static_cast<int>(props.size()) < K) {
+          if (llama_vocab_is_eog(impl_->vocab, dtok)) break;
+          props.push_back(dtok);
+          if (static_cast<int>(props.size()) >= K) break;
+          const llama_pos dpos =
+              static_cast<llama_pos>(impl_->d_cache_tokens.size());
+          if (decode_single_at(impl_->d_ctx, dtok, dpos)) break;
+          impl_->d_cache_tokens.push_back(dtok);
+        }
+      } else {
+        // n-gram prompt lookup: copy the continuation that followed this
+        // seed last time it appeared in fed (prompt or output so far).
+        const size_t seed =
+            std::min<size_t>(std::max(lookup_seed, 1), fed.size());
+        if (fed.size() > seed) {
+          const size_t tail = fed.size() - seed;
+          for (size_t i = tail; i-- > 0;) {
+            bool match = true;
+            for (size_t j = 0; j < seed; ++j) {
+              if (fed[i + j] != fed[tail + j]) {
+                match = false;
+                break;
+              }
+            }
+            if (!match) continue;
+            for (size_t j = seed;
+                 j < seed + static_cast<size_t>(K) && i + j < fed.size(); ++j)
+              props.push_back(fed[i + j]);
+            break;
+          }
+        }
       }
       const int n = static_cast<int>(props.size());
       if (n == 0) {
-        PRESTO_LOG_WARN("llamacpp", "draft produced no proposals; spec off");
-        llama_free(impl_->d_ctx);
-        impl_->d_ctx = nullptr;
-        break;
+        if (have_draft) {
+          PRESTO_LOG_WARN("llamacpp", "draft produced no proposals; spec off");
+          llama_free(impl_->d_ctx);
+          impl_->d_ctx = nullptr;
+          break;
+        }
+        // lookup found no match: one plain greedy step, retry next round.
+        const llama_token t = target_argmax_row(-1);
+        if (llama_vocab_is_eog(impl_->vocab, t)) {
+          impl_->cache_valid = false;
+          return true;
+        }
+        if (decode_single_at(impl_->ctx, t,
+                             static_cast<llama_pos>(fed.size()))) {
+          err = "step=spec msg=\"plain step failed\"";
+          impl_->cache_valid = false;
+          return false;
+        }
+        out_tokens.push_back(t);
+        fed.push_back(t);
+        pred_carry = target_argmax_row(-1);
+        continue;
       }
 
       // --- verify: feed d_1..d_n together, every row carries logits ---
@@ -731,28 +785,32 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
 
       // draft mirror: rewind rejected proposals, absorb `pred`, so D stays
       // token-aligned with T for the next round of proposals.
-      const size_t keep_d =
-          impl_->d_cache_tokens.size() - static_cast<size_t>(n - acc);
-      llama_memory_seq_rm(dmem, 0, static_cast<llama_pos>(keep_d), -1);
-      impl_->d_cache_tokens.resize(keep_d);
-      if (!stop) {
-        if (decode_single_at(impl_->d_ctx, pred,
-                             static_cast<llama_pos>(impl_->d_cache_tokens.size()))) {
-          PRESTO_LOG_WARN("llamacpp", "draft resync failed; spec off");
-          llama_free(impl_->d_ctx);
-          impl_->d_ctx = nullptr;
-        } else {
-          impl_->d_cache_tokens.push_back(pred);
+      if (have_draft) {
+        const size_t keep_d =
+            impl_->d_cache_tokens.size() - static_cast<size_t>(n - acc);
+        llama_memory_seq_rm(dmem, 0, static_cast<llama_pos>(keep_d), -1);
+        impl_->d_cache_tokens.resize(keep_d);
+        if (!stop) {
+          if (decode_single_at(impl_->d_ctx, pred,
+                               static_cast<llama_pos>(impl_->d_cache_tokens.size()))) {
+            PRESTO_LOG_WARN("llamacpp", "draft resync failed; spec off");
+            llama_free(impl_->d_ctx);
+            impl_->d_ctx = nullptr;
+          } else {
+            impl_->d_cache_tokens.push_back(pred);
+          }
         }
       }
 
-      if (stop || !impl_->d_ctx) break;
+      if (stop) break;
+      if (have_draft && !impl_->d_ctx) break;
       pred_carry = target_argmax_row(-1);
     }
 
     // the final correction is intentionally left unfed when stopped; the
     // prefix cache is invalidated rather than allowed to lie about state.
     impl_->cache_valid = false;
+    }
   }
 
   if (!speculative || plain_fallback) {
