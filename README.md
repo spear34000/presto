@@ -1,7 +1,7 @@
 <div align="center">
 
 <p align="center">
-  <img src="assets/logo.png" width="180" alt="presto logo"/>
+  <img src="assets/logo.png" width="150" alt="presto logo"/>
 </p>
 
 # presto
