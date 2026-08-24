@@ -147,12 +147,14 @@ int run_openai_server(const Detection& d, const std::string& host, int port) {
         // coalescing window: give simultaneous arrivals time to land in
         // the queue so one engine pass can carry them together
         if (!worker_stop)
-          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
         while (!queue.empty() && static_cast<int>(take.size()) < batch_slots) {
           take.push_back(std::move(queue.front()));
           queue.pop_front();
         }
       }
+      PRESTO_LOG_INFO("serve", "gathered " + std::to_string(take.size()) +
+                      " request(s) for one engine pass");
       if (take.size() > 1) {
         std::vector<BatchJob> jobs(take.size());
         for (size_t i = 0; i < take.size(); ++i) jobs[i].params = take[i]->params;
