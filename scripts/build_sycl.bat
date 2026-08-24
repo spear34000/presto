@@ -1,7 +1,8 @@
 @echo off
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
-call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 vs2022 >nul 2>&1
+call "C:\Program Files (x86)\Intel\oneAPI\2026.0\oneapi-vars.bat" >nul 2>&1
 where icx
+icx --version
 cmake -G Ninja -B build-sycl -S . ^
   -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx ^
   -DCMAKE_BUILD_TYPE=Release ^

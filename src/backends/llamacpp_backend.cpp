@@ -15,11 +15,23 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace presto {
+
+namespace fs = std::filesystem;
+
 namespace {
 std::string& spec_draft_path() {
   static std::string s;
@@ -144,7 +156,32 @@ bool LlamaCppBackend::load(std::string& err) {
     }
   }
 
-  impl_->n_ctx = static_cast<uint32_t>(env_int("PRESTO_CTX", 4096));
+  // Adaptive context size: scale with available system RAM so low-spec
+  // machines get a working default and high-spec machines get headroom.
+  // PRESTO_CTX overrides; otherwise RAM-derived.
+  {
+    uint64_t avail_bytes = 0;
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) avail_bytes = ms.ullAvailPhys;
+#elif defined(__APPLE__) || defined(__linux__)
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    uint64_t kb = 0;
+    while (meminfo >> key >> kb) {
+      if (key == "MemAvailable:") { avail_bytes = kb * 1024ULL; break; }
+      meminfo.ignore(1 << 20, '\n');
+    }
+#endif
+    const uint64_t free_gb = avail_bytes >> 30;
+    uint32_t auto_ctx = free_gb >= 12 ? 4096 : (free_gb >= 6 ? 2048 : 1024);
+    if (auto_ctx < 1024) auto_ctx = 1024;
+    impl_->n_ctx = static_cast<uint32_t>(env_int("PRESTO_CTX", static_cast<int32_t>(auto_ctx)));
+    PRESTO_LOG_INFO("llamacpp", "auto ctx=" + std::to_string(impl_->n_ctx) +
+                                    " (free ram " + std::to_string(free_gb) + " GB)");
+  }
+
   const int32_t hw = static_cast<int32_t>(std::thread::hardware_concurrency());
   impl_->threads =
       env_int("PRESTO_THREADS", hw > 0 ? std::min<int32_t>(hw, 8) : 4);
@@ -343,6 +380,78 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
     }
   }
 
+  // ---- persistent prompt snapshot ("compiled prompt" cache) ----
+  // Saves the post-prefill KV state of long prompts to disk, keyed by token
+  // hash. Future runs (even after restart) restore it instead of re-prefilling
+  // seconds of compute. The file embeds its own token list for verification.
+    auto decode_single_at = [&](llama_context* c, llama_token tok, llama_pos pos) {
+      llama_batch b = llama_batch_init(1, 0, 1);
+      b.n_tokens = 1;
+      b.token[0] = tok;
+      b.pos[0] = pos;
+      b.n_seq_id[0] = 1;
+      b.seq_id[0][0] = 0;
+      b.logits[0] = true;
+      const int rc = llama_decode(c, b);
+      llama_batch_free(b);
+      return rc != 0;
+    };
+
+  auto fnv1a64 = [](const std::vector<llama_token>& v, uint64_t seed) {
+    uint64_t h = seed;
+    for (llama_token t : v) { h ^= static_cast<uint64_t>(t); h *= 0x100000001b3ULL; }
+    return h;
+  };
+  const uint64_t model_key = [&] {
+    std::error_code ec;
+    const auto sz = static_cast<uint64_t>(fs::file_size(fs::path(path_), ec));
+    return sz ? sz : 0x9e3779b97f4a7c15ULL;
+  }();
+  const int snapshot_min = env_int("PRESTO_SNAPSHOT_MIN", 64);
+  const bool snapshots_on = [] {
+    const char* e = std::getenv("PRESTO_KV_SNAPSHOT");
+    return !(e && *e && e[0] == '0');
+  }();
+  bool snap_restored = false;
+  std::string snap_path;
+  if (snapshots_on && prompt.size() >= static_cast<size_t>(snapshot_min)) {
+    const char* lad = std::getenv("LOCALAPPDATA");
+    std::string dir = lad
+        ? std::string(lad) + "\\presto\\kv"
+        : std::string(std::getenv("HOME") ? std::getenv("HOME") : ".") + "/.presto/kv";
+    const uint64_t tokhash =
+        fnv1a64(prompt, fnv1a64(prompt, model_key ^ 0x243f6a8885a308d3ULL));
+    std::ostringstream ks; ks << std::hex << tokhash;
+    dir += "\\" + std::to_string(model_key % 100000);
+    snap_path = dir + "\\" + ks.str() + ".state";
+
+    if (llama_memory_t m0 = llama_get_memory(impl_->ctx)) {
+      llama_memory_clear(m0, true);
+      std::vector<llama_token> rtok(static_cast<size_t>(prompt.size()) + 8);
+      size_t ntok = 0;
+      const size_t got = llama_state_seq_load_file(
+          impl_->ctx, snap_path.c_str(), 0, rtok.data(), rtok.size(), &ntok);
+      bool ok = got > 0 && ntok == prompt.size() &&
+                std::equal(rtok.begin(), rtok.begin() + static_cast<long>(ntok),
+                           prompt.begin());
+      if (ok) {
+        llama_memory_seq_rm(m0, 0, static_cast<llama_pos>(prompt.size()) - 1, -1);
+        if (!decode_single_at(impl_->ctx, prompt.back(),
+                              static_cast<llama_pos>(prompt.size()) - 1)) {
+          PRESTO_LOG_INFO("llamacpp",
+                          "kv snapshot restored: " + std::to_string(ntok) +
+                              " tokens from " + snap_path);
+          snap_restored = true;
+        }
+        ok = false;
+      }
+      if (!ok && got == 0 && fs::exists(snap_path)) {
+        std::error_code ec2; fs::remove(snap_path, ec2);  // corrupt: drop
+      }
+    }
+  }
+
+  if (!snap_restored) {
   // ---- prefix-cache aware prefill ----
   // KV entries are exact functions of their token prefix, so a shared token
   // prefix with the previous request can skip re-evaluation of those tokens
@@ -399,6 +508,23 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
   }
   r.prefill_sec = now_sec() - prefill_t0;
 
+  if (snapshots_on && !snap_path.empty() &&
+      prompt.size() >= static_cast<size_t>(snapshot_min)) {
+    const std::string tmpf = snap_path + ".tmp";
+    if (llama_state_seq_save_file(impl_->ctx, tmpf.c_str(), 0, prompt.data(),
+                                  prompt.size()) > 0) {
+      std::error_code ec3;
+      fs::rename(tmpf, snap_path, ec3);
+      PRESTO_LOG_INFO("llamacpp",
+                      "kv snapshot saved: " + std::to_string(prompt.size()) +
+                          " tokens -> " + snap_path);
+    } else {
+      std::error_code ec3;
+      fs::remove(tmpf, ec3);
+    }
+  }
+  } // end !snap_restored prefill
+
   const int n_vocab = llama_n_vocab(impl_->vocab);
   unsigned rng_state =
       gp.seed >= 0
@@ -413,42 +539,30 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
   llama_memory_t tmem = impl_->ctx ? llama_get_memory(impl_->ctx) : nullptr;
   llama_memory_t dmem = impl_->d_ctx ? llama_get_memory(impl_->d_ctx) : nullptr;
 
+
   // Greedy + draft companion available -> speculative decoding. Outputs are
   // bit-identical to the loop below (greedy equivalence), just cheaper.
-  if (impl_->d_ctx && gp.temp <= 0.f && gp.max_tokens >= 4) {
-    const int K = env_int("PRESTO_SPEC_K", 6);
-    llama_memory_t tmem = llama_get_memory(impl_->ctx);
-    llama_memory_t dmem = llama_get_memory(impl_->d_ctx);
-
-    // draft prefill: same prompt (v1 = full re-prefill per request)
-    llama_memory_clear(llama_get_memory(impl_->d_ctx), true);
-    impl_->d_cache_tokens.clear();
-    for (int32_t off = 0; off < static_cast<int32_t>(prompt.size());
-         off += static_cast<int32_t>(impl_->n_ctx)) {
-      const int32_t chunk = std::min<int32_t>(
-          static_cast<int32_t>(impl_->n_ctx),
-          static_cast<int32_t>(prompt.size()) - off);
-      if (llama_decode(impl_->d_ctx,
-                       llama_batch_get_one(prompt.data() + off, chunk))) {
-        PRESTO_LOG_WARN("llamacpp", "draft prefill failed; spec decoding disabled");
-        llama_free(impl_->d_ctx);
-        impl_->d_ctx = nullptr;
-      }
-    }
-    if (!impl_->d_ctx) {
-      err = "step=spec msg=\"draft prefill failed\"";
-      return false;
-    }
-    impl_->d_cache_tokens = prompt;
-  }
-
   bool speculative = false;
   bool plain_fallback = false;
   if (impl_->d_ctx && gp.temp <= 0.f && gp.max_tokens >= 4) {
     speculative = true;
     const int Kmax = env_int("PRESTO_SPEC_K", 6);
-
     std::vector<llama_token> fed = prompt;  // exact mirror of target KV
+
+    auto draft_argmax_last = [&] {
+      const float* dl = llama_get_logits_ith(impl_->d_ctx, -1);
+      int best = 0;
+      for (int v = 1; v < n_vocab; ++v)
+        if (dl[v] > dl[best]) best = v;
+      return static_cast<llama_token>(best);
+    };
+    auto target_argmax_row = [&](int row) {
+      const float* lg = llama_get_logits_ith(impl_->ctx, row);
+      int best = 0;
+      for (int v = 1; v < n_vocab; ++v)
+        if (lg[v] > lg[best]) best = v;
+      return static_cast<llama_token>(best);
+    };
 
     // draft prefill: same prompt (v1 = full re-prefill per request)
     llama_memory_clear(llama_get_memory(impl_->d_ctx), true);
@@ -472,33 +586,6 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
     }
     impl_->d_cache_tokens = prompt;
 
-    auto decode_single_at = [&](llama_context* c, llama_token tok, llama_pos pos) {
-      llama_batch b = llama_batch_init(1, 0, 1);
-      b.n_tokens = 1;
-      b.token[0] = tok;
-      b.pos[0] = pos;
-      b.n_seq_id[0] = 1;
-      b.seq_id[0][0] = 0;
-      b.logits[0] = true;
-      const int rc = llama_decode(c, b);
-      llama_batch_free(b);
-      return rc != 0;
-    };
-    auto draft_argmax_last = [&] {
-      const float* dl = llama_get_logits_ith(impl_->d_ctx, -1);
-      int best = 0;
-      for (int v = 1; v < n_vocab; ++v)
-        if (dl[v] > dl[best]) best = v;
-      return static_cast<llama_token>(best);
-    };
-    auto target_argmax_row = [&](int row) {
-      const float* lg = llama_get_logits_ith(impl_->ctx, row);
-      int best = 0;
-      for (int v = 1; v < n_vocab; ++v)
-        if (lg[v] > lg[best]) best = v;
-      return static_cast<llama_token>(best);
-    };
-
     // emit the target's first greedy token from the prefill logits, feeding
     // it into both models so every later round starts uniform.
     llama_token pred_carry = 0;
@@ -508,13 +595,13 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
         impl_->cache_valid = false;
         return true;
       }
-      llama_token f1 = first_tok;
-      if (decode_single_at(impl_->ctx, f1, static_cast<llama_pos>(fed.size()))) {
+      if (decode_single_at(impl_->ctx, first_tok,
+                           static_cast<llama_pos>(fed.size()))) {
         err = "step=spec msg=\"first decode failed\"";
         impl_->cache_valid = false;
         return false;
       }
-      if (decode_single_at(impl_->d_ctx, f1,
+      if (decode_single_at(impl_->d_ctx, first_tok,
                            static_cast<llama_pos>(impl_->d_cache_tokens.size()))) {
         err = "step=spec msg=\"draft first decode failed\"";
         llama_free(impl_->d_ctx);
@@ -530,20 +617,18 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
     while (static_cast<int>(out_tokens.size()) < gp.max_tokens) {
       const int room = gp.max_tokens - static_cast<int>(out_tokens.size());
       const int K = std::min(Kmax, std::max(room - 1, 1));
-      PRESTO_LOG_DEBUG("llamacpp",
-                       "round-start out=" + std::to_string(out_tokens.size()) +
-                           " room=" + std::to_string(room) + " K=" + std::to_string(K));
       const llama_pos base = static_cast<llama_pos>(fed.size());
       if (base + K + 1 > static_cast<llama_pos>(impl_->n_ctx)) break;
 
-      // --- draft proposals: continue from the token D last absorbed ---
+      // --- draft proposals ---
       std::vector<llama_token> props;
       llama_token dtok = draft_argmax_last();
       while (static_cast<int>(props.size()) < K) {
         if (llama_vocab_is_eog(impl_->vocab, dtok)) break;
         props.push_back(dtok);
         if (static_cast<int>(props.size()) >= K) break;
-        const llama_pos dpos = static_cast<llama_pos>(impl_->d_cache_tokens.size());
+        const llama_pos dpos =
+            static_cast<llama_pos>(impl_->d_cache_tokens.size());
         if (decode_single_at(impl_->d_ctx, dtok, dpos)) break;
         impl_->d_cache_tokens.push_back(dtok);
       }
@@ -556,8 +641,6 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
       }
 
       // --- verify: feed d_1..d_n together, every row carries logits ---
-      // row i (position base+i, content d_{i+1}) predicts slot base+i+1,
-      // i.e. the correctness of proposal d_{i+2}.
       if (!llama_memory_seq_rm(tmem, 0, base, -1)) {
         err = "step=spec msg=\"target seq_rm failed\"";
         impl_->cache_valid = false;
@@ -581,7 +664,7 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
       }
 
       // acceptance walk: pred_carry validates d_1; each accepted proposal
-      // shifts validation to the next row; the final row yields the
+      // shifts validation one row deeper; the final row yields the
       // correction token that follows the longest accepted chain.
       int acc = 0;
       llama_token pred = pred_carry;
@@ -604,8 +687,8 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
         fed.push_back(pred);
         // slot base+acc still holds the rejected proposal; clear it and the
         // tail, then write `pred` at the exact position. Hybrid caches
-        // (Qwen3.5-style) may not support partial removal at all - in that
-        // case fall back to a full re-prefill of the accepted history.
+        // (Qwen3.5-style) may not support partial removal at all - fall back
+        // to a full re-prefill of the accepted history in that case.
         if (!llama_memory_seq_rm(tmem, 0, base + acc, -1)) {
           PRESTO_LOG_WARN("llamacpp",
                           "kv rollback unsupported by this architecture; "
@@ -634,9 +717,6 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
             }
           }
           pred_carry = target_argmax_row(-1);
-          PRESTO_LOG_DEBUG("llamacpp",
-                           "fallback entry out=" +
-                               std::to_string(out_tokens.size()));
           plain_fallback = true;
           break;
         }
@@ -646,10 +726,7 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
           return false;
         }
       } else {
-        if (!llama_memory_seq_rm(tmem, 0, base + acc, -1)) {
-          llama_memory_clear(tmem, true);
-          impl_->cache_valid = false;
-        }
+        llama_memory_seq_rm(tmem, 0, base + acc, -1);
       }
 
       // draft mirror: rewind rejected proposals, absorb `pred`, so D stays
@@ -659,18 +736,17 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
       llama_memory_seq_rm(dmem, 0, static_cast<llama_pos>(keep_d), -1);
       impl_->d_cache_tokens.resize(keep_d);
       if (!stop) {
-        llama_token nx = pred;
-        if (decode_single_at(impl_->d_ctx, nx, static_cast<llama_pos>(keep_d))) {
+        if (decode_single_at(impl_->d_ctx, pred,
+                             static_cast<llama_pos>(impl_->d_cache_tokens.size()))) {
           PRESTO_LOG_WARN("llamacpp", "draft resync failed; spec off");
           llama_free(impl_->d_ctx);
           impl_->d_ctx = nullptr;
         } else {
-          impl_->d_cache_tokens.push_back(nx);
+          impl_->d_cache_tokens.push_back(pred);
         }
       }
 
       if (stop || !impl_->d_ctx) break;
-      // T just absorbed `pred`; refresh the carried prediction from its row.
       pred_carry = target_argmax_row(-1);
     }
 

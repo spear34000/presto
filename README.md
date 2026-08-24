@@ -83,6 +83,14 @@ multi-turn chat and fixed system prompts get near-zero time-to-first-token
 on the shared part (**97% of prompt tokens skipped** measured), with outputs
 bit-identical to the uncached path.
 
+### Adaptive execution
+
+At load, presto probes the machine and tunes itself - no config files, works
+the same on a low-spec laptop and a workstation: inference threads from CPU
+topology, context size from available RAM (1024/2048/4096 tiers), GPU layer
+offload from device memory. Every knob stays overridable via environment
+variables for full manual control.
+
 ### Speculative decoding
 
 `--draft small.gguf` implements greedy speculative decoding whose outputs are
