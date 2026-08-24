@@ -87,6 +87,16 @@ multi-turn chat and fixed system prompts get near-zero time-to-first-token
 on the shared part (**97% of prompt tokens skipped** measured), with outputs
 bit-identical to the uncached path.
 
+### Continuous batching
+
+`presto serve` gathers concurrent requests into one engine pass - a single
+weight-streaming decode step produces one token for **each** waiting user,
+so the bandwidth wall is paid once and shared. Measured aggregate
+throughput: **1.6x** (CPU, 4 users) and **1.8x** (Arc iGPU, 4 users) over
+sequential serving. Greedy requests batch automatically; sampled
+(temperature > 0) requests run sequentially with identical semantics.
+Slots via `PRESTO_BATCH_SLOTS` (default 4).
+
 ### Adaptive execution
 
 At load, presto probes the machine and tunes itself - no config files, works

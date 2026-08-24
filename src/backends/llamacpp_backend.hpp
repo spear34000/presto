@@ -25,6 +25,7 @@ public:
   const char* name() const override { return "llamacpp"; }
   bool load(std::string& err) override;
   bool generate(const GenerateParams& p, GenerateResult& r, std::string& err) override;
+  bool generate_many(std::vector<BatchJob>& jobs, std::string& err) override;
 
 private:
   struct Impl;

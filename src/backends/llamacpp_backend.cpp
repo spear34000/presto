@@ -86,6 +86,7 @@ struct LlamaCppBackend::Impl {
   const llama_vocab* vocab = nullptr;
   llama_context* ctx = nullptr;
   uint32_t n_ctx = 0;
+  uint32_t max_slots = 1;
   int32_t threads = 0;
   ggml_threadpool_t tpool = nullptr;
   ggml_threadpool_t tpool_batch = nullptr;
@@ -191,6 +192,11 @@ bool LlamaCppBackend::load(std::string& err) {
   cparams.n_batch = impl_->n_ctx;
   cparams.n_threads = impl_->threads;
   cparams.n_threads_batch = impl_->threads;
+  // KV pool is shared across sequences; n_ctx stays the TOTAL budget so the
+  // single-stream path is untouched and batch slots borrow from the pool.
+  impl_->max_slots =
+      static_cast<uint32_t>(std::max(1, env_int("PRESTO_BATCH_SLOTS", 4)));
+  cparams.n_seq_max = impl_->max_slots;
 
   // Flash Attention: opt-in via PRESTO_FLASH_ATTN=1. Default stays AUTO -
   // forced FA measured slower than the naive path on some small models.
@@ -865,6 +871,204 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
   r.tok_per_sec =
       r.decode_sec > 0 ? static_cast<double>(out_tokens.size()) / r.decode_sec : 0.0;
   r.load_sec = load_sec_;
+  return true;
+}
+
+bool LlamaCppBackend::generate_many(std::vector<BatchJob>& jobs, std::string& err) {
+  if (jobs.empty()) return true;
+  if (jobs.size() == 1) {
+    jobs[0].ok = generate(jobs[0].params, jobs[0].result, jobs[0].err);
+    return true;
+  }
+  for (const auto& j : jobs) {
+    if (j.params.temp > 0.f) {
+      err = "batch requires greedy (temp<=0)";
+      return false;
+    }
+  }
+  if (!impl_ || !impl_->model || !impl_->vocab || !impl_->ctx) {
+    err = "step=state msg=\"backend not loaded\"";
+    return false;
+  }
+
+  const int n_vocab_v = llama_n_vocab(impl_->vocab);
+  const size_t S = std::min(jobs.size(), static_cast<size_t>(impl_->max_slots));
+
+  struct BSlot {
+    std::vector<llama_token> prompt;
+    std::vector<llama_token> gen;
+    bool active = false;
+  };
+  std::vector<BSlot> slot(S);
+
+  auto tokenize_into = [&](const GenerateParams& gp,
+                           std::vector<llama_token>& out) -> bool {
+    if (!gp.prompt_text.empty()) {
+      const int32_t text_len = static_cast<int32_t>(gp.prompt_text.size());
+      bool add_special = true;
+      int32_t need = llama_tokenize(impl_->vocab, gp.prompt_text.c_str(),
+                                    text_len, nullptr, 0, add_special, true);
+      if (need == -1 || need == INT32_MIN) {
+        add_special = false;
+        need = llama_tokenize(impl_->vocab, gp.prompt_text.c_str(), text_len,
+                              nullptr, 0, add_special, true);
+      }
+      if (need <= 0 && need != INT32_MIN) need = -need;
+      if (need <= 0 || need == INT32_MIN) return false;
+      out.resize(static_cast<std::size_t>(need));
+      int32_t n = llama_tokenize(impl_->vocab, gp.prompt_text.c_str(), text_len,
+                                 out.data(), need, add_special, true);
+      if (n < 0 && n != INT32_MIN) {
+        need = -n;
+        out.resize(static_cast<std::size_t>(need));
+        n = llama_tokenize(impl_->vocab, gp.prompt_text.c_str(), text_len,
+                           out.data(), need, add_special, true);
+      }
+      if (n < 0) return false;
+      out.resize(static_cast<std::size_t>(n));
+      return !out.empty();
+    }
+    for (int t : gp.prompt_tokens) out.push_back(static_cast<llama_token>(t));
+    return !out.empty();
+  };
+
+  for (size_t j = 0; j < S; ++j) {
+    auto& job = jobs[j];
+    if (!tokenize_into(job.params, slot[j].prompt)) {
+      job.err = "step=tokenize msg=\"batch tokenize failed\"";
+      continue;
+    }
+    if (slot[j].prompt.size() + static_cast<size_t>(job.params.max_tokens) + 8 >
+        impl_->n_ctx) {
+      job.err = "step=batch msg=\"request exceeds context pool\"";
+      continue;
+    }
+    slot[j].active = true;
+    llama_memory_seq_rm(llama_get_memory(impl_->ctx),
+                        static_cast<llama_seq_id>(j), 0, -1);
+  }
+
+  double batch_t0 = now_sec();
+  for (size_t j = 0; j < S; ++j) {
+    if (!slot[j].active) continue;
+    const auto& p = slot[j].prompt;
+    for (int32_t off = 0; off < static_cast<int32_t>(p.size());
+         off += static_cast<int32_t>(impl_->n_ctx)) {
+      const int32_t chunk =
+          std::min<int32_t>(static_cast<int32_t>(impl_->n_ctx),
+                            static_cast<int32_t>(p.size()) - off);
+      llama_batch pb = llama_batch_init(chunk, 0, 1);
+      pb.n_tokens = chunk;
+      for (int32_t i = 0; i < chunk; ++i) {
+        pb.token[i] = p[static_cast<size_t>(off + i)];
+        pb.pos[i] = static_cast<llama_pos>(off + i);
+        pb.n_seq_id[i] = 1;
+        pb.seq_id[i][0] = static_cast<llama_seq_id>(j);
+        pb.logits[i] = (off + i == static_cast<int32_t>(p.size()) - 1);
+      }
+      const int rc = llama_decode(impl_->ctx, pb);
+      llama_batch_free(pb);
+      if (rc) {
+        slot[j].active = false;
+        jobs[j].err = "step=batch_prefill msg=\"prefill failed\"";
+        break;
+      }
+    }
+    if (!slot[j].active) continue;
+    // sample the first token straight from the prefill logits so the
+    // decode loop never re-feeds a position the prompt already occupies
+    const float* prow = llama_get_logits_ith(impl_->ctx, -1);
+    int pbest = 0;
+    for (int v = 1; v < n_vocab_v; ++v)
+      if (prow[v] > prow[pbest]) pbest = v;
+    if (llama_vocab_is_eog(impl_->vocab, static_cast<llama_token>(pbest))) {
+      slot[j].active = false;
+    } else {
+      slot[j].gen.push_back(static_cast<llama_token>(pbest));
+      if (static_cast<int>(slot[j].gen.size()) >= jobs[j].params.max_tokens)
+        slot[j].active = false;
+    }
+  }
+
+  while (true) {
+    std::vector<size_t> live;
+    for (size_t j = 0; j < S; ++j)
+      if (slot[j].active &&
+          static_cast<int>(slot[j].gen.size()) < jobs[j].params.max_tokens)
+        live.push_back(j);
+    if (live.empty()) break;
+
+    llama_batch db = llama_batch_init(static_cast<int32_t>(live.size()), 0, 1);
+    db.n_tokens = static_cast<int32_t>(live.size());
+    for (size_t k = 0; k < live.size(); ++k) {
+      const size_t j = live[k];
+      BSlot& s = slot[j];
+      db.token[k] = s.gen.empty() ? s.prompt.back() : s.gen.back();
+      db.pos[k] =
+          static_cast<llama_pos>(s.prompt.size() + s.gen.size() - 1);
+      db.n_seq_id[k] = 1;
+      db.seq_id[k][0] = static_cast<llama_seq_id>(j);
+      db.logits[k] = true;
+    }
+    const int rc = llama_decode(impl_->ctx, db);
+    llama_batch_free(db);
+    if (rc) {
+      err = "step=batch_decode msg=\"decode failed\"";
+      for (auto& s2 : slot) s2.active = false;
+      break;
+    }
+    for (size_t k = 0; k < live.size(); ++k) {
+      const size_t j = live[k];
+      BSlot& s = slot[j];
+      const float* row = llama_get_logits_ith(impl_->ctx,
+                                              static_cast<int32_t>(k));
+      int best = 0;
+      for (int v = 1; v < n_vocab_v; ++v)
+        if (row[v] > row[best]) best = v;
+      const llama_token tok = static_cast<llama_token>(best);
+      if (llama_vocab_is_eog(impl_->vocab, tok)) {
+        s.active = false;
+        continue;
+      }
+      s.gen.push_back(tok);
+      if (static_cast<int>(s.gen.size()) >= jobs[j].params.max_tokens)
+        s.active = false;
+    }
+  }
+
+  const double decode_sec = now_sec() - batch_t0;
+  llama_memory_clear(llama_get_memory(impl_->ctx), true);
+  impl_->cache_valid = false;
+
+  for (size_t j = 0; j < S; ++j) {
+    auto& job = jobs[j];
+    auto& s = slot[j];
+    if (!job.ok && job.err.empty() && s.gen.empty()) continue;
+    if (s.gen.empty()) continue;
+    job.result.decode_sec = decode_sec;
+    job.result.tok_per_sec =
+        decode_sec > 0
+            ? static_cast<double>(s.gen.size()) / decode_sec
+            : 0.0;
+    job.result.load_sec = load_sec_;
+    job.result.tokens.assign(s.gen.begin(), s.gen.end());
+    int32_t need = 512;
+    std::vector<char> buf(static_cast<std::size_t>(need));
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      const int32_t n = llama_detokenize(
+          impl_->vocab, s.gen.data(), static_cast<int32_t>(s.gen.size()),
+          buf.data(), need, false, false);
+      if (n >= 0) {
+        job.result.text.assign(buf.data(), static_cast<std::size_t>(n));
+        break;
+      }
+      need = -n;
+      buf.resize(static_cast<std::size_t>(need));
+    }
+    job.ok = true;
+  }
+  PRESTO_LOG_INFO("llamacpp", "batched " + std::to_string(S) +
+                                  " request(s) in one engine pass");
   return true;
 }
 

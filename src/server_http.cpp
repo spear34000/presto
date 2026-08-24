@@ -1,4 +1,4 @@
-// presto - OpenAI-compatible HTTP server (cpp-httplib based)
+﻿// presto - OpenAI-compatible HTTP server (cpp-httplib based)
 #include "presto/server.hpp"
 
 #include "json_mini.hpp"
@@ -10,8 +10,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace presto {
@@ -114,9 +118,61 @@ int run_openai_server(const Detection& d, const std::string& host, int port) {
 
   httplib::Server svr;
   std::atomic<long long> req_counter{0};
-  // one engine instance -> generation must be serialized; httplib dispatches
-  // connections on multiple threads
-  std::mutex gen_mutex;
+  auto env_int_local = [](const char* k, int dflt) {
+    if (const char* v = std::getenv(k)) { try { return std::stoi(v); } catch (...) {} }
+    return dflt;
+  };
+  const int batch_slots = std::max(1, env_int_local("PRESTO_BATCH_SLOTS", 4));
+
+  // one worker thread owns the engine; concurrent requests are gathered so
+  // N users share each weight-streaming decode via generate_many()
+  struct PendingJob {
+    GenerateParams params;
+    GenerateResult result;
+    std::string err;
+    bool ok = false;
+    bool done = false;
+  };
+  std::mutex qm;
+  std::condition_variable cv_q, cv_done;
+  std::deque<std::shared_ptr<PendingJob>> queue;
+  bool worker_stop = false;
+  std::thread worker([&] {
+    for (;;) {
+      std::vector<std::shared_ptr<PendingJob>> take;
+      {
+        std::unique_lock<std::mutex> lk(qm);
+        cv_q.wait(lk, [&] { return worker_stop || !queue.empty(); });
+        if (worker_stop && queue.empty()) return;
+        // coalescing window: give simultaneous arrivals time to land in
+        // the queue so one engine pass can carry them together
+        if (!worker_stop)
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        while (!queue.empty() && static_cast<int>(take.size()) < batch_slots) {
+          take.push_back(std::move(queue.front()));
+          queue.pop_front();
+        }
+      }
+      if (take.size() > 1) {
+        std::vector<BatchJob> jobs(take.size());
+        for (size_t i = 0; i < take.size(); ++i) jobs[i].params = take[i]->params;
+        if (!backend->generate_many(jobs, err)) {
+          for (auto& j : jobs) j.ok = backend->generate(j.params, j.result, j.err);
+        }
+        for (size_t i = 0; i < take.size(); ++i) {
+          take[i]->ok = jobs[i].ok;
+          take[i]->result = std::move(jobs[i].result);
+          take[i]->err = std::move(jobs[i].err);
+          take[i]->done = true;
+        }
+      } else {
+        auto& job = *take[0];
+        job.ok = backend->generate(job.params, job.result, job.err);
+        job.done = true;
+      }
+      cv_done.notify_all();
+    }
+  });
   const std::string model_field = json_escape(d.path);
 
   svr.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
@@ -133,7 +189,6 @@ int run_openai_server(const Detection& d, const std::string& host, int port) {
 
   auto handle_generate = [&](bool chat, const httplib::Request& req,
                              httplib::Response& res) {
-    std::lock_guard<std::mutex> lock(gen_mutex);
     RequestOpts opts;
     std::string perr;
     if (!parse_request_body(req.body, chat, opts, perr)) {
@@ -142,17 +197,27 @@ int run_openai_server(const Detection& d, const std::string& host, int port) {
                       "application/json");
       return;
     }
-    GenerateParams gp;
-    gp.prompt_text = opts.prompt_text;
-    gp.prompt_tokens = opts.prompt_tokens;
-    gp.max_tokens = opts.max_tokens;
-    gp.temp = opts.temp;
+    auto job = std::make_shared<PendingJob>();
+    job->params.prompt_text = opts.prompt_text;
+    job->params.prompt_tokens = opts.prompt_tokens;
+    job->params.max_tokens = opts.max_tokens;
+    job->params.temp = opts.temp;
+    {
+      std::lock_guard<std::mutex> lk(qm);
+      queue.push_back(job);
+    }
+    cv_q.notify_one();
+    {
+      std::unique_lock<std::mutex> lk(qm);
+      cv_done.wait(lk, [&] { return job->done; });
+    }
 
-    GenerateResult r;
-    if (!backend->generate(gp, r, err)) {
-      PRESTO_LOG_ERROR("serve", "generate failed: " + err);
+    GenerateResult& r = job->result;
+    if (!job->ok) {
+      PRESTO_LOG_ERROR("serve", "generate failed: " + job->err);
       res.status = 500;
-      res.set_content(R"({"error":{"message":")" + json_escape(err) + R"("}})",
+      res.set_content(R"({"error":{"message":")" + json_escape(job->err) +
+                          R"("}})",
                       "application/json");
       return;
     }
