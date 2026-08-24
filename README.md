@@ -1,6 +1,10 @@
 <div align="center">
 
-# 🎼 presto
+<p align="center">
+  <img src="assets/logo.png" width="180" alt="presto logo"/>
+</p>
+
+# presto
 
 ### Unified LLM inference in C/C++
 
