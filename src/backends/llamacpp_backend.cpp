@@ -192,8 +192,19 @@ bool LlamaCppBackend::load(std::string& err) {
   }
 
   const int32_t hw = static_cast<int32_t>(std::thread::hardware_concurrency());
+  // Small models live in cache and are latency-bound: more threads only add
+  // sync overhead (SmolLM2 measured 228 tok/s at 4 threads vs 136 at 8).
+  // Large models stream weights and scale to the full core count.
+  std::error_code fs_ec;
+  const uint64_t model_bytes = fs::file_size(fs::path(path_), fs_ec);
+  int32_t default_threads;
+  if (!fs_ec && model_bytes < (1ull << 30)) {
+    default_threads = std::min<int32_t>(hw > 0 ? hw : 4, 4);
+  } else {
+    default_threads = hw > 0 ? std::min<int32_t>(hw, 8) : 4;
+  }
   impl_->threads =
-      env_int("PRESTO_THREADS", hw > 0 ? std::min<int32_t>(hw, 8) : 4);
+      env_int("PRESTO_THREADS", default_threads);
 
   llama_context_params cparams = llama_context_default_params();
   cparams.n_ctx = impl_->n_ctx;

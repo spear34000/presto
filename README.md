@@ -123,9 +123,19 @@ offload, UMA spill handled):
 
 At load, presto probes the machine and tunes itself - no config files, works
 the same on a low-spec laptop and a workstation: inference threads from CPU
-topology, context size from available RAM (1024/2048/4096 tiers), GPU layer
-offload from device memory. Every knob stays overridable via environment
-variables for full manual control.
+topology **and model size** (cache-resident models get 4 threads - SmolLM2
+measured +43% vs the naive core count; large models scale to all cores),
+context size from available RAM (1024/2048/4096 tiers), GPU layer offload
+from device memory. Every knob stays overridable via environment variables
+for full manual control.
+
+CPU route, measured on this machine (Lunar Lake, auto-tuned):
+
+| Model | Solo | 8-user aggregate |
+|---|---|---|
+| SmolLM2-135M Q8_0 | 194 tok/s | **387 tok/s** |
+| Qwen2.5-0.5B Q8_0 | 82 tok/s | - |
+| Qwen3.5-9B Q4_K_M | 8.2 tok/s | - |
 
 ### Speculative decoding
 
