@@ -1,8 +1,8 @@
 ﻿# presto verification report
 
-- date: 2026-08-24 00:43 +09:00
+- date: 2026-08-25 11:09 +09:00
 - host: Windows 11, Lunar Lake CPU 8 threads, Intel Arc 140V iGPU, 31.5GB RAM
-- binaries: build-full (CPU) / build-vulkan (Vulkan), commit 3d94bce
+- binaries: build-full (CPU) / build-vulkan (Vulkan), commit 4c31a4e
 
 | Area | Check | Result | Detail |
 |---|---|---|---|
@@ -17,8 +17,8 @@
 | server | startup health | PASS |  |
 | server-defense | malformed JSON -> 400, server alive | PASS | http=400 |
 | server-defense | empty object rejected | PASS | http=400 |
-| soak | 40 sequential chat completions | PASS | fails=0 med=208ms |
-| safety | RSS growth over soak <= 60MB | PASS | growth=2.4MB |
+| soak | 40 sequential chat completions | PASS | fails=0 med=165ms |
+| safety | RSS growth over soak <= 60MB | PASS | growth=0.9MB |
 | concurrency | 6 parallel clients all 200 | PASS | codes=200,200,200,200,200,200 |
 | gpu-vulkan | capability reports vulkan=yes | PASS |  |
 
