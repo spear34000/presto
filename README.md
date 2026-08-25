@@ -97,6 +97,28 @@ sequential serving. Greedy requests batch automatically; sampled
 (temperature > 0) requests run sequentially with identical semantics.
 Slots via `PRESTO_BATCH_SLOTS` (default 4).
 
+### Persistent n-gram memory
+
+Beyond per-request prompt lookup, presto keeps a **200k-token cross-request
+pool** that survives the server lifetime. The second identical request
+reuses n-grams from the first's output without a model. Measured on
+R1-Distill-Qwen-32B (repetitive reasoning prompt): **23.2s -> 11.9s
+(1.95x)**. Together with batching, this turns the 11.9 tok/s bandwidth wall
+into an effective **11.7 tok/s per-user** on the second hit and
+**~17 tok/s combined** when stacked.
+
+### Large model serving (30B class)
+
+Quantization makes >16GB models servable on 16GB Arc iGPU (full 65/65 GPU
+offload, UMA spill handled):
+
+| Model | Quant | Size | Solo | Batch x8 agg. |
+|---|---|---|---|---|
+| R1-Distill-Qwen-32B | Q3_K_M | 14.84GB | 4.8 tok/s | 7.2 |
+| R1-Distill-Qwen-32B | Q2_K | 11.47GB | 6.0 | 9.0 |
+| Gemma-4-26B-A4B | Q3_K_M | - | 14.2 | **35.0** |
+| GPT-OSS-20B | Q4_K_M | 11.62GB | 21.7 | 36.0 |
+
 ### Adaptive execution
 
 At load, presto probes the machine and tunes itself - no config files, works
@@ -143,6 +165,8 @@ attention) fall back gracefully mid-request instead of failing.
 | **gemma-4-26B-A4B-it**      | **gemma4** | Q3_K_M | **GPU** | OK | OK | **14.2** |
 | **gpt-oss-20b**             | **gpt-oss** | Q4_K_M | **GPU** | OK | OK | **21.7** |
 | Qwen3.5-9B-Instruct         | qwen35   | Q4_K_M | CPU/SYCL | OK | OK | 6.1 / **11.9** |
+| R1-Distill-Qwen-32B         | qwen2    | Q3_K_M | GPU | OK | OK | 4.8 |
+| R1-Distill-Qwen-32B         | qwen2    | Q2_K | GPU | OK | OK | 6.0 |
 
 Every row: format detection, two identical invocations producing identical
 token ids, and a Tempo Report run. SYCL route for qwen35 measured with
