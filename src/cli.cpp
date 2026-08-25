@@ -29,6 +29,7 @@ void note_draft_path(const std::string& p) {
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -56,21 +57,23 @@ void print_error_line(const std::string& step, const std::string& msg) {
 
 void print_usage(std::FILE* out) {
   std::fprintf(out,
-               "presto %s - unified LLM runtime (gguf | safetensors | pytorch | awq | gptq | mlx)\n"
-               "\"presto\": Italian musical term - very fast (172-208 BPM). We take the marking seriously.\n\n"
-               "USAGE:\n"
-               "  presto info <model-path>\n"
-               "  presto run <model-path> [--prompt \"...\"] [--prompt-tokens \"1,2,3\"]\n"
-               "              [--max-tokens N] [--temp F] [--seed N]\n"
-               "  presto bench <model-path> [--steps N] [--warmup N] [--runs N]\n"
-               "              [--temp F]\n"
-               "  presto serve <model-path> [--host H] [--port P]\n"
-               "  presto version\n\n"
-               "ENV:\n"
-               "  PRESTO_LOG=debug|info|warn|error   log level (stderr)\n"
-               "  PRESTO_SMOKE=1                     emit machine-readable success line on run\n"
-               "  PRESTO_THREADS=N                   inference threads (default: hw threads, cap 8)\n"
-               "  PRESTO_CTX=N                       context size for gguf models (default 4096)\n",
+               "presto %s - unified LLM runtime\n\n"
+               "QUICK START:\n"
+               "  presto models                    list discovered models\n"
+               "  presto chat qwen2.5-0.5b         interactive chat (multi-turn)\n"
+               "  presto run <model> --prompt \"hi\" one-shot generation\n\n"
+               "COMMANDS:\n"
+               "  models                            list models (./models + LM Studio)\n"
+               "  chat  <model> [--temp F] [--max-tokens N]   interactive REPL\n"
+               "  run   <model> [--prompt \"...\"] [--max-tokens N] [--temp F]\n"
+               "        [--seed N] [--draft small.gguf]\n"
+               "  bench <model> [--steps N] [--warmup N] [--runs N]\n"
+               "  serve <model> [--host H] [--port P]   OpenAI-compatible API\n"
+               "  info  <model>                     inspect any format\n"
+               "  version                           capability report\n\n"
+               "Model names resolve automatically: 'presto run phi-4' finds\n"
+               "phi-4*.gguf in ./models and your LM Studio library.\n\n"
+               "ENV: PRESTO_THREADS PRESTO_CTX PRESTO_LOG PRESTO_SMOKE\n",
                kVersion);
 }
 
@@ -170,6 +173,89 @@ int cmd_info(const std::vector<std::string>& args) {
   return d.format == ModelFormat::UNKNOWN ? kUnsupportedFormat : kOk;
 }
 
+void hint_models(const std::string& ref) {
+  std::error_code ec;
+  if (!std::filesystem::exists(std::filesystem::path(ref), ec)) {
+    std::fprintf(stderr, "hint: model '%s' not found - run 'presto models' to list what is available\n",
+                 ref.c_str());
+  }
+}
+
+int cmd_chat(const std::vector<std::string>& args) {
+  if (args.empty()) {
+    print_usage(stderr);
+    return kUsage;
+  }
+  std::string model_path = args[0];
+  float temp = 0.0f;
+  int max_tokens = 512;
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    const std::string& a = args[i];
+    if (a == "--temp" && i + 1 < args.size()) {
+      if (!parse_float(args[++i].c_str(), temp)) {
+        print_error_line("usage", "--temp expects a float");
+        return kUsage;
+      }
+      continue;
+    }
+    if (a == "--max-tokens" && i + 1 < args.size()) {
+      long long n = 0;
+      if (!parse_int(args[++i].c_str(), n)) {
+        print_error_line("usage", "--max-tokens expects an integer");
+        return kUsage;
+      }
+      max_tokens = static_cast<int>(n);
+      continue;
+    }
+    print_error_line("usage", "unknown option '" + a + "'");
+    return kUsage;
+  }
+
+  const std::string resolved = resolve_model_path(model_path);
+  const Detection d = detect_format(resolved);
+  if (d.format == ModelFormat::UNKNOWN) {
+    print_error_line("detect", d.summary);
+    hint_models(model_path);
+    return kUnsupportedFormat;
+  }
+  std::string err;
+  auto backend = select_backend(d, err);
+  if (!backend) {
+    print_error_line("select_backend", err);
+    return kBackendUnavailable;
+  }
+  if (!backend->load(err)) {
+    print_error_line("load", err);
+    return kInferenceFailure;
+  }
+
+  std::printf("presto chat - %s (%s backend)\n", d.path.c_str(), backend->name());
+  std::printf("type your message; 'exit' or Ctrl-Z quits.\n\n");
+  std::string history;
+  for (;;) {
+    std::printf("you> ");
+    std::fflush(stdout);
+    std::string line;
+    if (!std::getline(std::cin, line)) break;
+    if (line.empty()) continue;
+    if (line == "exit" || line == "quit" || line == "/q") break;
+
+    history += "User: " + line + "\nAssistant:";
+    GenerateParams p;
+    p.prompt_text = history;
+    p.max_tokens = max_tokens;
+    p.temp = temp;
+    GenerateResult r;
+    if (!backend->generate(p, r, err)) {
+      print_error_line("generate", err);
+      return kInferenceFailure;
+    }
+    std::printf("bot> %s  (%.1f tok/s)\n\n", r.text.c_str(), r.tok_per_sec);
+    history += " " + r.text + "\n";
+  }
+  return kOk;
+}
+
 int cmd_run(const std::vector<std::string>& args) {
   if (args.empty()) {
     print_usage(stderr);
@@ -242,6 +328,7 @@ int cmd_run(const std::vector<std::string>& args) {
   const Detection d = detect_format(resolve_model_path(model_path));
   if (d.format == ModelFormat::UNKNOWN) {
     print_error_line("detect", d.summary);
+    hint_models(model_path);
     return kUnsupportedFormat;
   }
 
@@ -432,9 +519,15 @@ int main(int argc, char** argv) {
   try {
     if (cmd == "version") return cmd_version();
     if (cmd == "models") {
-      for (const auto& p : list_known_models()) std::printf("%s\n", p.c_str());
+      for (const auto& p : list_known_models()) {
+        std::error_code ec;
+        const uint64_t bytes = std::filesystem::file_size(std::filesystem::path(p), ec);
+        const double mb = ec ? 0.0 : static_cast<double>(bytes) / (1024.0 * 1024.0);
+        std::printf("%8.0f MB  %s\n", mb, p.c_str());
+      }
       return kOk;
     }
+    if (cmd == "chat") return cmd_chat({argv + 2, argv + argc});
     if (cmd == "info") return cmd_info({argv + 2, argv + argc});
     if (cmd == "run") return cmd_run({argv + 2, argv + argc});
     if (cmd == "bench") return cmd_bench({argv + 2, argv + argc});
