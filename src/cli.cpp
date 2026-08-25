@@ -39,7 +39,7 @@ void note_draft_path(const std::string& p) {
 namespace presto {
 namespace {
 
-constexpr const char* kVersion = "0.3.0";
+constexpr const char* kVersion = "0.3.1";
 
 enum ExitCode : int {
   kOk = 0,
