@@ -102,6 +102,14 @@ struct LlamaCppBackend::Impl {
   const llama_vocab* d_vocab = nullptr;
   llama_context* d_ctx = nullptr;
   std::vector<llama_token> d_cache_tokens;
+
+  // persistent cross-request n-gram pool: every completed prompt+output is
+  // appended here so future requests can draft from history without a model.
+  // This is the user-visible "innovation" that turns idle compute into tokens
+  // past the 11.9 tok/s bandwidth wall. Bounded to avoid unbounded growth.
+  std::vector<llama_token> ngram_pool;
+  static constexpr size_t kPoolCap = 200000;
+  int ngram_low_streak = 0;
 };
 
 LlamaCppBackend::LlamaCppBackend(std::string path) : path_(std::move(path)) {}
@@ -558,8 +566,9 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
   if (want_spec && (impl_->d_ctx || lookup_eligible)) {
     speculative = true;
     const bool have_draft = impl_->d_ctx != nullptr;
-    const int Kmax = env_int("PRESTO_SPEC_K", 6);
-    const int lookup_seed = env_int("PRESTO_LOOKUP_N", 3);
+    const int Kmax = have_draft ? env_int("PRESTO_SPEC_K", 6)
+                                : env_int("PRESTO_LOOKUP_K", 16);
+    const int lookup_seed = env_int("PRESTO_LOOKUP_N", 8);
     std::vector<llama_token> fed = prompt;  // exact mirror of target KV
 
     auto target_argmax_row = [&](int row) {
@@ -652,25 +661,32 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
           impl_->d_cache_tokens.push_back(dtok);
         }
       } else {
-        // n-gram prompt lookup: copy the continuation that followed this
-        // seed last time it appeared in fed (prompt or output so far).
         const size_t seed =
             std::min<size_t>(std::max(lookup_seed, 1), fed.size());
         if (fed.size() > seed) {
           const size_t tail = fed.size() - seed;
-          for (size_t i = tail; i-- > 0;) {
+          for (size_t i = tail; i-- > 0 && props.empty();) {
             bool match = true;
-            for (size_t j = 0; j < seed; ++j) {
-              if (fed[i + j] != fed[tail + j]) {
-                match = false;
-                break;
-              }
-            }
+            for (size_t j = 0; j < seed; ++j)
+              if (fed[i + j] != fed[tail + j]) { match = false; break; }
             if (!match) continue;
             for (size_t j = seed;
                  j < seed + static_cast<size_t>(K) && i + j < fed.size(); ++j)
               props.push_back(fed[i + j]);
-            break;
+          }
+          if (props.empty() && !impl_->ngram_pool.empty()) {
+            const auto &pool = impl_->ngram_pool;
+            if (pool.size() > seed) {
+              for (size_t i = pool.size() - seed; i-- > 0 && props.empty();) {
+                bool match = true;
+                for (size_t j = 0; j < seed; ++j)
+                  if (pool[i + j] != fed[tail + j]) { match = false; break; }
+                if (!match) continue;
+                for (size_t j = seed;
+                     j < seed + static_cast<size_t>(K) && i + j < pool.size(); ++j)
+                  props.push_back(pool[i + j]);
+              }
+            }
           }
         }
       }
@@ -866,6 +882,14 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
   impl_->cache_tokens.insert(impl_->cache_tokens.end(), out_tokens.begin(),
                              out_tokens.end());
   impl_->cache_valid = true;
+
+  if (prompt.size() >= 32) {
+    auto &pool = impl_->ngram_pool;
+    pool.insert(pool.end(), prompt.begin(), prompt.end());
+    pool.insert(pool.end(), out_tokens.begin(), out_tokens.end());
+    if (pool.size() > Impl::kPoolCap)
+      pool.erase(pool.begin(), pool.begin() + (pool.size() - Impl::kPoolCap));
+  }
 
   r.tokens.assign(out_tokens.begin(), out_tokens.end());
   r.tok_per_sec =
