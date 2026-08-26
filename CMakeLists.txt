@@ -94,6 +94,23 @@ FetchContent_Declare(httplib
 FetchContent_MakeAvailable(httplib)
 
 # ---------------------------------------------------------------------------
+# Native execution core (no llama.cpp/ggml/vendor SDK types)
+# ---------------------------------------------------------------------------
+add_library(presto_runtime_core STATIC
+    src/runtime/buffer.cpp
+    src/runtime/context.cpp
+    src/runtime/gguf.cpp
+    src/runtime/mapped_file.cpp
+    src/runtime/registry.cpp
+    src/runtime/tensor.cpp)
+target_include_directories(presto_runtime_core PUBLIC include)
+if(MSVC)
+  target_compile_options(presto_runtime_core PRIVATE /W4 /permissive- /EHsc)
+else()
+  target_compile_options(presto_runtime_core PRIVATE -Wall -Wextra)
+endif()
+
+# ---------------------------------------------------------------------------
 # presto executable
 # ---------------------------------------------------------------------------
 add_executable(presto
@@ -103,10 +120,13 @@ add_executable(presto
     src/gguf_meta.cpp
     src/resolve.cpp
     src/server_http.cpp
-    src/st_meta.cpp)
+    src/st_meta.cpp
+    src/own/gguf_load.cpp
+    src/own/tokenizer.cpp
+    src/own/llama_graph.cpp)
 
 target_include_directories(presto PRIVATE include src)
-target_link_libraries(presto PRIVATE httplib::httplib)
+target_link_libraries(presto PRIVATE httplib::httplib presto_runtime_core)
 
 if(MSVC)
   target_compile_options(presto PRIVATE /W4 /permissive- /EHsc)
@@ -172,12 +192,19 @@ if(PRESTO_BUILD_TESTS)
       tests/test_gguf_meta.cpp
       tests/test_json_mini.cpp
       tests/test_st_meta.cpp
+      tests/test_utf8.cpp
+      tests/test_runtime_tensor.cpp
+      tests/test_runtime_buffer.cpp
+      tests/test_runtime_context.cpp
+      tests/test_runtime_gguf.cpp
+      tests/test_runtime_registry.cpp
       # library sources under test (no CLI/server/backends)
       src/detector.cpp
       src/engine.cpp
       src/gguf_meta.cpp
       src/st_meta.cpp)
   target_include_directories(presto_tests PRIVATE include src tests)
+  target_link_libraries(presto_tests PRIVATE presto_runtime_core)
   if(MSVC)
     target_compile_options(presto_tests PRIVATE /W4 /permissive- /EHsc)
   else()

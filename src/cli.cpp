@@ -5,6 +5,8 @@
 #include "presto/log.hpp"
 #include "presto/resolve.hpp"
 #include "presto/server.hpp"
+#include "own/own.hpp"
+#include "presto/utf8.hpp"
 
 #ifdef PRESTO_WITH_LLAMACPP
 #include "backends/llamacpp_backend.hpp"
@@ -36,6 +38,10 @@ void note_draft_path(const std::string& p) {
 #include <sstream>
 #include <string>
 #include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace presto {
 namespace {
@@ -231,7 +237,7 @@ int cmd_chat(const std::vector<std::string>& args) {
 
   std::printf("presto chat - %s (%s backend)\n", d.path.c_str(), backend->name());
   std::printf("type your message; 'exit' or Ctrl-Z quits.\n\n");
-  std::string history;
+  std::vector<ChatMessage> history;
   for (;;) {
     std::printf("you> ");
     std::fflush(stdout);
@@ -240,9 +246,9 @@ int cmd_chat(const std::vector<std::string>& args) {
     if (line.empty()) continue;
     if (line == "exit" || line == "quit" || line == "/q") break;
 
-    history += "User: " + line + "\nAssistant:";
+    history.push_back({"user", line});
     GenerateParams p;
-    p.prompt_text = history;
+    p.chat_messages = history;
     p.max_tokens = max_tokens;
     p.temp = temp;
     GenerateResult r;
@@ -251,7 +257,7 @@ int cmd_chat(const std::vector<std::string>& args) {
       return kInferenceFailure;
     }
     std::printf("bot> %s  (%.1f tok/s)\n\n", r.text.c_str(), r.tok_per_sec);
-    history += " " + r.text + "\n";
+    history.push_back({"assistant", r.text});
   }
   return kOk;
 }
@@ -269,6 +275,7 @@ int cmd_run(const std::vector<std::string>& args) {
   float temp = 0.0f;
   long long seed = -1;
   std::string draft_path;
+  std::string engine;
 
   for (std::size_t i = 1; i < args.size(); ++i) {
     const std::string& a = args[i];
@@ -319,11 +326,100 @@ int cmd_run(const std::vector<std::string>& args) {
       draft_path = args[++i];
       continue;
     }
+    if (a == "--engine" && i + 1 < args.size()) {
+      engine = args[++i];
+      continue;
+    }
     print_error_line("usage", "unknown option '" + a + "'");
     return kUsage;
   }
 
   if (!draft_path.empty()) note_draft_path(draft_path);
+
+  if (engine == "own") {
+    std::string own_err;
+    own::GGufModel m;
+    if (!own::GGufModel::load(resolve_model_path(model_path), m, own_err)) {
+      print_error_line("own_load", own_err);
+      hint_models(model_path);
+      return kInferenceFailure;
+    }
+    if (const char* dbg = std::getenv("PRESTO_OWN_DEBUG"); dbg) {
+      if (const own::Tensor* t = m.tensor("token_embd.weight")) {
+        const int ne0 = static_cast<int>(t->ne[0]);
+        std::fprintf(stderr, "[own-debug] emb[9038][0..7]:");
+        for (int i = 0; i < 8; ++i)
+          std::fprintf(stderr, " %.4f", t->data[9038 * ne0 + i]);
+        std::fprintf(stderr, "\n[own-debug] emb[1][0..7]:");
+        for (int i = 0; i < 8; ++i)
+          std::fprintf(stderr, " %.4f", t->data[ne0 + i]);
+        std::fprintf(stderr, "\n");
+      }
+      if (const own::Tensor* t = m.tensor("output.weight")) {
+        const int ne0 = static_cast<int>(t->ne[0]);
+        std::fprintf(stderr, "[own-debug] out_w ne=[%u,%u] row0[0..7]:",
+                     t->ne[0], t->ne[1]);
+        for (int i = 0; i < 8; ++i)
+          std::fprintf(stderr, " %.4f", t->data[i]);
+        std::fprintf(stderr, "\n");
+      }
+    }
+    std::vector<int> ids;
+    if (!prompt_text.empty()) {
+      ids = m.encode(prompt_text);
+    } else if (!prompt_tokens.empty()) {
+      ids.assign(prompt_tokens.begin(), prompt_tokens.end());
+    }
+    if (ids.empty()) {
+      print_error_line("own_encode", "empty prompt");
+      return kUsage;
+    }
+    const double t0s = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    std::vector<int> out;
+    for (int step = 0; step < max_tokens; ++step) {
+      std::vector<float> logits;
+      if (!own::llama_forward(m, ids, logits, own_err)) {
+        print_error_line("own_forward", own_err);
+        return kInferenceFailure;
+      }
+      if (const char* dbg = std::getenv("PRESTO_OWN_DEBUG");
+          dbg && step == 0) {
+        std::vector<int> idx(logits.size());
+        for (int i = 0; i < static_cast<int>(idx.size()); ++i) idx[i] = i;
+        std::partial_sort(idx.begin(), idx.begin() + 5, idx.end(),
+                          [&](int a, int b) { return logits[a] > logits[b]; });
+        std::fprintf(stderr, "[own-debug] prompt_ids:");
+        for (int id : ids) std::fprintf(stderr, " %d", id);
+        std::fprintf(stderr, "\n[own-debug] top5:");
+        for (int i = 0; i < 5; ++i)
+          std::fprintf(stderr, " %d(%.4f)", idx[i], logits[idx[i]]);
+        std::fprintf(stderr, "\n");
+      }
+      int best = 0;
+      for (int v = 1; v < m.n_vocab; ++v)
+        if (logits[v] > logits[best]) best = v;
+      if (best == 2 || best == 0) break; // </s> / unk
+      out.push_back(best);
+      ids.push_back(best);
+    }
+    const double t1s = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    std::string text = m.decode(out);
+    if (!text.empty()) std::printf("%s\n", text.c_str());
+    std::printf("--- generated %zu token(s)", out.size());
+    if (!out.empty()) {
+      std::printf(": ");
+      for (std::size_t i = 0; i < out.size(); ++i)
+        std::printf("%d%s", out[i], i + 1 < out.size() ? "," : "");
+    }
+    const double dt = t1s - t0s;
+    std::printf("\n[own-engine] %.2f tok/s (full recompute)\n",
+                dt > 0 ? static_cast<double>(out.size()) / dt : 0.0);
+    return kOk;
+  }
 
   const Detection d = detect_format(resolve_model_path(model_path));
   if (d.format == ModelFormat::UNKNOWN) {
@@ -343,6 +439,7 @@ int cmd_run(const std::vector<std::string>& args) {
 
   GenerateParams p;
   p.prompt_text = prompt_text;
+  if (!prompt_text.empty()) p.chat_messages.push_back({"user", prompt_text});
   p.prompt_tokens = prompt_tokens;
   p.max_tokens = max_tokens > 0 ? max_tokens : 32;
   p.temp = temp;
@@ -507,10 +604,10 @@ int cmd_bench(const std::vector<std::string>& args) {
 #ifdef PRESTO_WITH_LLAMACPP
 #endif
 
-int main(int argc, char** argv) {
+int presto_main(const std::vector<std::string>& argv) {
   using namespace presto;
 
-  if (argc < 2) {
+  if (argv.size() < 2) {
     print_usage(stderr);
     return kUsage;
   }
@@ -527,12 +624,12 @@ int main(int argc, char** argv) {
       }
       return kOk;
     }
-    if (cmd == "chat") return cmd_chat({argv + 2, argv + argc});
-    if (cmd == "info") return cmd_info({argv + 2, argv + argc});
-    if (cmd == "run") return cmd_run({argv + 2, argv + argc});
-    if (cmd == "bench") return cmd_bench({argv + 2, argv + argc});
+    if (cmd == "chat") return cmd_chat({argv.begin() + 2, argv.end()});
+    if (cmd == "info") return cmd_info({argv.begin() + 2, argv.end()});
+    if (cmd == "run") return cmd_run({argv.begin() + 2, argv.end()});
+    if (cmd == "bench") return cmd_bench({argv.begin() + 2, argv.end()});
     if (cmd == "serve") {
-      std::vector<std::string> args{argv + 2, argv + argc};
+      std::vector<std::string> args{argv.begin() + 2, argv.end()};
       if (args.empty()) {
         print_usage(stderr);
         return kUsage;
@@ -567,3 +664,19 @@ int main(int argc, char** argv) {
     return kGenericError;
   }
 }
+
+#if defined(_WIN32)
+int wmain(int argc, wchar_t** argv) {
+  SetConsoleCP(CP_UTF8);
+  SetConsoleOutputCP(CP_UTF8);
+  std::vector<std::string> args;
+  args.reserve(static_cast<size_t>(argc));
+  for (int i = 0; i < argc; ++i) args.push_back(presto::utf8_from_wide(argv[i]));
+  return presto_main(args);
+}
+#else
+int main(int argc, char** argv) {
+  std::vector<std::string> args(argv, argv + argc);
+  return presto_main(args);
+}
+#endif
