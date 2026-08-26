@@ -63,19 +63,19 @@ nothing beyond a C++20 compiler.
         |                 IBackend interface                   |
         |   load()   generate()   generate_many()              |
         +--------+--------------------------------+------------+
-                 |                               |
-                 v                               v
-   +-----------------------------+   +-------------------------+
-   |     LlamaCpp backend        |   |      MLX backend        |
-   |  - adaptive ctx/threads     |   |  mlx core ops,          |
-   |  - prefix KV cache          |   |  Llama-family forward   |
-   |  - speculative decoding     |   |  pass at token-id level |
-   |    (draft model + n-gram    |   +-------------------------+
-   |     pool)                   |
-   |  - continuous batching      |
-   |  - ggml devices: CPU, CUDA, |
-   |    Vulkan, HIP, SYCL, Metal |
-   +--------------+--------------+
+                  |                               |               |
+                  v                               v               v
+    +-----------------------------+   +-------------------------+  +------------------+
+    |     LlamaCpp backend        |   |      MLX backend        |  |   Own backend    |
+    |  - adaptive ctx/threads     |   |  mlx core ops,          |  |  ggml-free,      |
+    |  - prefix KV cache          |   |  Llama-family forward   |  |  --engine own   |
+    |  - speculative decoding     |   |  pass at token-id level |  |  full-recompute|
+    |    (draft model + n-gram    |   +-------------------------+  |  (no KV cache) |
+    |     pool)                   |                                +------------------+
+    |  - continuous batching      |
+    |  - ggml devices: CPU, CUDA, |
+    |    Vulkan, HIP, SYCL, Metal |
+    +--------------+--------------+
                   ^  generate_many(jobs)
                   |
    +--------------+--------------+         +--------------------------+
@@ -271,6 +271,35 @@ produces one token for each waiting user, aggregate throughput measured
 up to 35-36 tok/s aggregate on the iGPU for Gemma-4-26B-A4B and GPT-OSS-20B
 at batch 8.
 
+## Own inference engine (ggml-free)
+
+`src/own/` is the first milestone toward complete independence from
+llama.cpp/ggml. It has zero external dependencies and builds even with
+`PRESTO_WITH_LLAMACPP=OFF`:
+
+- `src/own/gguf_load.cpp` - GGUF v2/v3 header, key/value map (all scalar
+  types, string and string-array handling with byte-accurate string
+  boundaries, v1 narrow counts), tensor table, alignment, and dequantization
+  to f32 for F32/F16/BF16/Q4_0/Q8_0/Q4_K/Q6_K. Q4_0 uses the split-nibble
+  layout where byte j holds element j in the low nibble and element j+16 in
+  the high nibble (verified against `ggml-quants.c:quantize_row_q4_0_ref`
+  and `gguf-py`'s official `dequantize`).
+- `src/own/tokenizer.cpp` - SentencePiece BPE rebuilt purely from the
+  GGUF-embedded `tokenizer.ggml.tokens/scores/token_type` arrays, with byte
+  fallback (`<0xNN>`) and `tokenizer.ggml.add_bos_token` handling.
+- `src/own/llama_graph.cpp` - Llama-family forward pass: token gathering,
+  per-layer RMSNorm, Q/K/V projections, GGML-convention interleaved RoPE
+  (pairs `(2i, 2i+1)`), causal GQA attention, SwiGLU FFN, and the final
+  RMSNorm plus `output.weight` (falling back to `token_embd.weight` when
+  tied). Full recompute per call (no KV cache) in v0 - correctness over
+  speed. Selected with `presto run <model> --engine own`.
+
+Validation: F32 models (stories260K) match the llama.cpp backend
+bit-identically on greedy decoding; stories15M Q4_0 does as well after the
+Q4_0 layout fix. Quantized models diverge only where ggml's block-dot
+kernels (per-block integer accumulation then scaling) differ numerically from
+f32 dequantization - the next milestone ports those exact kernels.
+
 ## The MLX backend
 
 On Apple Silicon, `src/backends/mlx_backend.cpp` implements a minimal
@@ -403,6 +432,10 @@ tok/s M1 baseline). Failures always upload full stage logs as artifacts.
 | `src/runtime/gguf.cpp` | Complete GGUF metadata/tensor descriptor parsing and extent validation |
 | `src/runtime/mapped_file.cpp` | Win32/POSIX read-only file mapping for tensor payloads |
 | `src/runtime/registry.cpp` | Host provider and device registry implementation |
+| `src/own/own.hpp` | Own engine contract: Tensor, GGufModel, llama_forward |
+| `src/own/gguf_load.cpp` | GGUF v2/v3 parser and F32/F16/BF16/Q4_0/Q8_0/Q4_K/Q6_K dequantization |
+| `src/own/tokenizer.cpp` | SentencePiece BPE from GGUF-embedded vocab |
+| `src/own/llama_graph.cpp` | Llama forward graph (RMSNorm, RoPE, GQA, SwiGLU) |
 | `tests/test_main.cpp` | Zero-dependency test harness entry |
 | `tests/test_detector.cpp` | Detector tests across all supported formats |
 | `tests/test_engine_select.cpp` | Backend routing tests |

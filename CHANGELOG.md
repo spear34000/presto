@@ -14,6 +14,16 @@ unless stated.
 
 ### Added
 
+- Own ggml-free inference engine (`src/own/`, `c73b4d7`): self-contained GGUF
+  v2/v3 loader (F32/F16/BF16/Q4_0/Q8_0/Q4_K/Q6_K dequant), SentencePiece
+  tokenizer from the embedded GGUF vocab, and a llama-arch forward graph
+  (RMSNorm, interleaved RoPE, GQA, SwiGLU) in full-recompute mode.
+  `presto run <model> --engine own` executes without llama.cpp. Validated
+  stories15M greedy 20 tok bit-identical to the llama.cpp backend; stories260K
+  F32 runs at 1300 tok/s. Key fix found by diffing against gguf-py's
+  official dequantize: Q4_0 stores byte j as element j in the low nibble and
+  element j+16 in the high nibble (the split-nibble layout from
+  `ggml-quants.c:quantize_row_q4_0_ref`), not sequential pairs.
 - The first dependency-free native runtime layer: structured status/results,
   overflow-checked tensor metadata, aligned host buffers and views, device
   contracts, and deterministic provider registration. It builds and tests
