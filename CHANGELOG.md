@@ -14,6 +14,16 @@ unless stated.
 
 ### Added
 
+- The first dependency-free native runtime layer: structured status/results,
+  overflow-checked tensor metadata, aligned host buffers and views, device
+  contracts, and deterministic provider registration. It builds and tests
+  with `PRESTO_WITH_LLAMACPP=OFF` as the foundation for replacing ggml model
+  execution family by family.
+- Native GGUF ingestion now indexes every tensor without llama.cpp, validates
+  shapes, quantization block sizes, alignment, overlap, and file bounds, and
+  exposes exact tensor payloads through read-only Windows/POSIX memory maps.
+  `presto info` reports the native tensor data offset, byte total, and type
+  inventory.
 - `presto chat`: an interactive multi-turn REPL. Each message is appended to
   the running conversation, replies print with per-turn throughput, and
   `exit`, `quit`, `/q`, or Ctrl-Z ends the session. Options mirror `run`
@@ -27,6 +37,17 @@ These additions build on the size-aware CPU thread auto-tuning that landed
 in v0.3.1: cache-resident models (under 1 GB) run with four inference
 threads instead of the naive core count, which measured +43% decode
 throughput on SmolLM2-135M.
+
+### Fixed
+
+- Windows command arguments and console output now remain UTF-8, and chat/run
+  requests use the model's embedded GGUF chat template instead of feeding raw
+  user text. This fixes Korean prompts producing mojibake and repeated garbage
+  tokens.
+- Context growth now checks capacity per logical sequence. With four batch
+  slots, a shared `n_ctx=2048` pool exposes 512 tokens per sequence; requests
+  that exceed that limit grow the pool before decode instead of failing near
+  token 498 with `failed to find a memory slot`.
 
 ## [v0.3.1] - 2026-08-25
 

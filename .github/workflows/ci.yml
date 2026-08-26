@@ -97,7 +97,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Configure (core only, no network-heavy deps)
+      - name: Configure (native core only, no inference-runtime dependency)
         run: |
           set -o pipefail
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DPRESTO_WITH_LLAMACPP=OFF 2>&1 | tee logs/01-configure.log
@@ -107,7 +107,7 @@ jobs:
           set -o pipefail
           cmake --build build --config Release --parallel 2>&1 | tee logs/02-build.log
 
-      - name: Unit tests
+      - name: Native core and parser unit tests
         run: |
           set -o pipefail
           ./build/presto_tests 2>&1 | tee logs/03-tests.log

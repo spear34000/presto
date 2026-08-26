@@ -3,12 +3,14 @@
 
 #include "json_mini.hpp"
 #include "presto/gguf_meta.hpp"
+#include "presto/runtime/gguf.hpp"
 #include "presto/st_meta.hpp"
 
 #include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <set>
 
 namespace fs = std::filesystem;
 
@@ -61,6 +63,25 @@ Detection detect_file(const std::string& path) {
                 std::to_string(info.tensor_count) + " tensors" +
                 (info.architecture.empty() ? "" : ", arch=" + info.architecture);
     d.meta = info.to_meta();
+    const auto index = runtime::read_gguf_index(path);
+    if (!index.ok()) {
+      return unknown_det(path, "GGUF tensor index failed: " + index.status.message);
+    }
+    std::uint64_t tensor_bytes = 0;
+    std::set<std::string> tensor_types;
+    for (const auto& tensor : index.value.tensors) {
+      tensor_bytes += tensor.byte_size;
+      const auto traits = runtime::gguf_type_traits(tensor.type);
+      if (traits.ok()) tensor_types.insert(traits.value.name);
+    }
+    std::string type_list;
+    for (const auto& type : tensor_types) {
+      if (!type_list.empty()) type_list += ',';
+      type_list += type;
+    }
+    d.meta["tensor_data_offset"] = std::to_string(index.value.data_offset);
+    d.meta["tensor_bytes"] = std::to_string(tensor_bytes);
+    d.meta["tensor_types"] = type_list.empty() ? "(none)" : type_list;
     return d;
   }
 

@@ -5,6 +5,7 @@
 #include "backends/llamacpp_backend.hpp"
 
 #include "presto/log.hpp"
+#include "presto/runtime/context.hpp"
 
 #include "llama.h"
 #include "ggml-backend.h"
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <thread>
 #include <vector>
@@ -77,6 +79,44 @@ llama_token sample_token(const float* logits, int n_vocab, float temp, unsigned&
   std::discrete_distribution<int> dist(probs.begin(), probs.end());
   rng_state = rng();
   return static_cast<llama_token>(dist(rng));
+}
+
+bool render_chat_prompt(const llama_model* model, const std::vector<ChatMessage>& messages,
+                        const std::string& raw_prompt, std::string& rendered, std::string& err) {
+  if (messages.empty()) {
+    rendered = raw_prompt;
+    return true;
+  }
+  const char* tmpl = llama_model_chat_template(model, nullptr);
+  if (!tmpl) {
+    // Keep `run` useful for base models that do not declare a template.
+    if (!raw_prompt.empty()) {
+      rendered = raw_prompt;
+      return true;
+    }
+    for (const auto& message : messages)
+      rendered += message.role + ": " + message.content + "\n";
+    rendered += "assistant: ";
+    return true;
+  }
+  std::vector<llama_chat_message> chat;
+  chat.reserve(messages.size());
+  for (const auto& message : messages)
+    chat.push_back({message.role.c_str(), message.content.c_str()});
+  int32_t needed = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, nullptr, 0);
+  if (needed <= 0) {
+    err = "step=chat_template msg=\"model template could not be rendered\"";
+    return false;
+  }
+  std::vector<char> buffer(static_cast<size_t>(needed) + 1);
+  const int32_t written = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true,
+                                                    buffer.data(), static_cast<int32_t>(buffer.size()));
+  if (written < 0 || written > static_cast<int32_t>(buffer.size())) {
+    err = "step=chat_template msg=\"model template render failed\"";
+    return false;
+  }
+  rendered.assign(buffer.data(), static_cast<size_t>(written));
+  return true;
 }
 
 } // namespace
@@ -328,20 +368,23 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
     return false;
   }
 
+  std::string prompt_text;
+  if (!render_chat_prompt(impl_->model, gp.chat_messages, gp.prompt_text, prompt_text, err)) return false;
+
   std::vector<llama_token> prompt;
-  if (!gp.prompt_text.empty()) {
-    const int32_t text_len = static_cast<int32_t>(gp.prompt_text.size());
+  if (!prompt_text.empty()) {
+    const int32_t text_len = static_cast<int32_t>(prompt_text.size());
     // llama.h contract: null buffer -> negative required count; INT32_MIN/-1
     // are hard failures. Some BPE vocabs without a usable BOS return -1 when
     // add_special=true, so retry once with specials disabled.
     bool add_special = true;
-    int32_t need = llama_tokenize(impl_->vocab, gp.prompt_text.c_str(), text_len,
+    int32_t need = llama_tokenize(impl_->vocab, prompt_text.c_str(), text_len,
                                   nullptr, 0, add_special, true);
     if (need == -1 || need == INT32_MIN) {
       PRESTO_LOG_DEBUG("llamacpp", "tokenize sizing with specials returned " +
                                        std::to_string(need) + "; retrying without");
       add_special = false;
-      need = llama_tokenize(impl_->vocab, gp.prompt_text.c_str(), text_len,
+      need = llama_tokenize(impl_->vocab, prompt_text.c_str(), text_len,
                             nullptr, 0, add_special, true);
     }
     if (need == INT32_MIN || (need < 0 && -need > (1 << 20))) {
@@ -354,12 +397,12 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
       return false;
     }
     prompt.resize(static_cast<std::size_t>(need));
-    int32_t n = llama_tokenize(impl_->vocab, gp.prompt_text.c_str(), text_len,
+    int32_t n = llama_tokenize(impl_->vocab, prompt_text.c_str(), text_len,
                                prompt.data(), need, add_special, true);
     if (n < 0 && n != INT32_MIN) {
       need = -n;
       prompt.resize(static_cast<std::size_t>(need));
-      n = llama_tokenize(impl_->vocab, gp.prompt_text.c_str(), text_len,
+      n = llama_tokenize(impl_->vocab, prompt_text.c_str(), text_len,
                          prompt.data(), need, add_special, true);
     }
     if (n < 0) {
@@ -376,20 +419,33 @@ bool LlamaCppBackend::generate(const GenerateParams& gp, GenerateResult& r, std:
     return false;
   }
 
-  // Recreate the context only when a request could exceed its capacity.
-  const uint32_t needed = static_cast<uint32_t>(prompt.size() + gp.max_tokens + 8);
-  if (needed > impl_->n_ctx) {
-    uint32_t grown = impl_->n_ctx;
-    while (grown < needed) grown *= 2;
+  // llama.cpp divides n_ctx across n_seq_max. Compare the request against
+  // logical per-sequence capacity, not the shared pool size.
+  const std::uint64_t needed_wide =
+      static_cast<std::uint64_t>(prompt.size()) + gp.max_tokens + 8;
+  if (needed_wide > std::numeric_limits<std::uint32_t>::max()) {
+    err = "step=context msg=\"requested token capacity exceeds uint32\"";
+    return false;
+  }
+  const auto capacity = runtime::grow_context_capacity(
+      impl_->n_ctx, impl_->max_slots, static_cast<std::uint32_t>(needed_wide));
+  if (!capacity.ok()) {
+    err = "step=context msg=\"" + capacity.status.message + "\"";
+    return false;
+  }
+  if (capacity.value.total_tokens != impl_->n_ctx) {
+    const uint32_t grown = capacity.value.total_tokens;
     PRESTO_LOG_INFO("llamacpp",
                     "growing context " + std::to_string(impl_->n_ctx) + " -> " +
-                        std::to_string(grown));
+                        std::to_string(grown) + " (per-sequence " +
+                        std::to_string(capacity.value.per_sequence_tokens) + ")");
     llama_free(impl_->ctx);
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = grown;
     cparams.n_batch = grown;
     cparams.n_threads = impl_->threads;
     cparams.n_threads_batch = impl_->threads;
+    cparams.n_seq_max = impl_->max_slots;
     impl_->ctx = llama_init_from_model(impl_->model, cparams);
     if (!impl_->ctx) {
       impl_->ctx = nullptr;
@@ -938,25 +994,29 @@ bool LlamaCppBackend::generate_many(std::vector<BatchJob>& jobs, std::string& er
 
   auto tokenize_into = [&](const GenerateParams& gp,
                            std::vector<llama_token>& out) -> bool {
-    if (!gp.prompt_text.empty()) {
-      const int32_t text_len = static_cast<int32_t>(gp.prompt_text.size());
+    std::string prompt_text;
+    std::string template_err;
+    if (!render_chat_prompt(impl_->model, gp.chat_messages, gp.prompt_text,
+                            prompt_text, template_err)) return false;
+    if (!prompt_text.empty()) {
+      const int32_t text_len = static_cast<int32_t>(prompt_text.size());
       bool add_special = true;
-      int32_t need = llama_tokenize(impl_->vocab, gp.prompt_text.c_str(),
+      int32_t need = llama_tokenize(impl_->vocab, prompt_text.c_str(),
                                     text_len, nullptr, 0, add_special, true);
       if (need == -1 || need == INT32_MIN) {
         add_special = false;
-        need = llama_tokenize(impl_->vocab, gp.prompt_text.c_str(), text_len,
+        need = llama_tokenize(impl_->vocab, prompt_text.c_str(), text_len,
                               nullptr, 0, add_special, true);
       }
       if (need <= 0 && need != INT32_MIN) need = -need;
       if (need <= 0 || need == INT32_MIN) return false;
       out.resize(static_cast<std::size_t>(need));
-      int32_t n = llama_tokenize(impl_->vocab, gp.prompt_text.c_str(), text_len,
+      int32_t n = llama_tokenize(impl_->vocab, prompt_text.c_str(), text_len,
                                  out.data(), need, add_special, true);
       if (n < 0 && n != INT32_MIN) {
         need = -n;
         out.resize(static_cast<std::size_t>(need));
-        n = llama_tokenize(impl_->vocab, gp.prompt_text.c_str(), text_len,
+        n = llama_tokenize(impl_->vocab, prompt_text.c_str(), text_len,
                            out.data(), need, add_special, true);
       }
       if (n < 0) return false;

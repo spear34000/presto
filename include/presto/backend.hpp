@@ -6,9 +6,15 @@
 
 namespace presto {
 
+struct ChatMessage {
+  std::string role;
+  std::string content;
+};
+
 struct GenerateParams {
   std::vector<int> prompt_tokens; // used when prompt_text empty (mlx path)
   std::string prompt_text;        // preferred for backends with a tokenizer
+  std::vector<ChatMessage> chat_messages;
   int max_tokens = 32;
   float temp = 0.0f;              // <=0 => greedy
   long long seed = -1;

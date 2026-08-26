@@ -53,6 +53,7 @@ std::string timestamp_seconds() {
 struct RequestOpts {
   std::string prompt_text;
   std::vector<int> prompt_tokens;
+  std::vector<ChatMessage> chat_messages;
   int max_tokens = 16;
   float temp = 0.0f;
 };
@@ -70,13 +71,14 @@ bool parse_request_body(const std::string& body, const bool chat, RequestOpts& o
       err = "missing messages[]";
       return false;
     }
-    // naive template: "<role>: <content>\n" per message (roadmap: real chat templates)
     for (const auto& m : msgs->items()) {
       const json::Node* role = m.find("role");
       const json::Node* content = m.find("content");
-      if (role && role->is_string()) opts.prompt_text += role->as_string() + ": ";
-      if (content && content->is_string()) opts.prompt_text += content->as_string();
-      opts.prompt_text += "\n";
+      if (!role || !role->is_string() || !content || !content->is_string()) {
+        err = "each message requires string role and content";
+        return false;
+      }
+      opts.chat_messages.push_back({role->as_string(), content->as_string()});
     }
   } else {
     const json::Node* p = root.find("prompt");
@@ -202,6 +204,7 @@ int run_openai_server(const Detection& d, const std::string& host, int port) {
     auto job = std::make_shared<PendingJob>();
     job->params.prompt_text = opts.prompt_text;
     job->params.prompt_tokens = opts.prompt_tokens;
+    job->params.chat_messages = opts.chat_messages;
     job->params.max_tokens = opts.max_tokens;
     job->params.temp = opts.temp;
     {

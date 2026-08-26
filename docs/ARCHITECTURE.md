@@ -97,6 +97,14 @@ every configuration. The two backend boxes are conditionally compiled:
 llama.cpp when `PRESTO_WITH_LLAMACPP=ON` (the default), MLX only on Apple
 Silicon.
 
+The llama.cpp execution box is now a migration adapter rather than the
+long-term core. `presto_runtime_core` owns provider-neutral status, tensor,
+buffer, device, and registry contracts under `include/presto/runtime/`.
+Those headers expose no llama.cpp, ggml, BLAS-provider, or GPU-SDK types and
+build when every inference backend is disabled. Model ingestion, operators,
+sessions, and GPU providers will move behind this boundary family by family;
+the adapter is removed after parity gates pass for the supported matrix.
+
 ## Format detection
 
 `detect_format()` in `src/detector.cpp` classifies any filesystem path and
@@ -184,8 +192,10 @@ possible:
 
 - Tokenization uses a sizing pass with a retry that disables special tokens
   for BPE vocabs whose BOS handling returns errors.
-- Context growth doubles `n_ctx` when a request could exceed capacity, then
-  invalidates the prefix cache since fresh memory holds nothing reusable.
+- Context growth compares the request with `n_ctx / n_seq_max`, the logical
+  per-sequence capacity of llama.cpp's shared KV pool. It doubles the total
+  pool until that logical capacity fits, preserves the configured slot count,
+  then invalidates the prefix cache since fresh memory holds nothing reusable.
 - The persistent prompt snapshot ("compiled prompt" cache) saves post-prefill
   KV state to disk for prompts of 64+ tokens (`PRESTO_SNAPSHOT_MIN`),
   keyed by an FNV-1a hash of the token list plus the model file size, under
@@ -380,6 +390,19 @@ tok/s M1 baseline). Failures always upload full stage logs as artifacts.
 | `include/presto/log.hpp` | Leveled header-only logger; PRESTO_LOG override |
 | `include/presto/resolve.hpp` | Model resolution API |
 | `include/presto/server.hpp` | run_openai_server API |
+| `include/presto/runtime/status.hpp` | Provider-neutral status and result contracts |
+| `include/presto/runtime/tensor.hpp` | Native dtype, shape, stride, and checked-size contracts |
+| `include/presto/runtime/buffer.hpp` | Device buffer interface, aligned host storage, checked tensor views |
+| `include/presto/runtime/context.hpp` | Shared-pool and logical per-sequence context capacity contracts |
+| `include/presto/runtime/gguf.hpp` | Native GGUF type traits, tensor index, mapped weights, and zero-copy spans |
+| `include/presto/runtime/device.hpp` | Provider-neutral device capabilities and host device |
+| `include/presto/runtime/registry.hpp` | Deterministic device registration and lookup |
+| `src/runtime/tensor.cpp` | Overflow-safe scalar and quantized tensor layout arithmetic |
+| `src/runtime/buffer.cpp` | Host allocation and tensor-view boundary validation |
+| `src/runtime/context.cpp` | Overflow-safe context-pool capacity and growth calculation |
+| `src/runtime/gguf.cpp` | Complete GGUF metadata/tensor descriptor parsing and extent validation |
+| `src/runtime/mapped_file.cpp` | Win32/POSIX read-only file mapping for tensor payloads |
+| `src/runtime/registry.cpp` | Host provider and device registry implementation |
 | `tests/test_main.cpp` | Zero-dependency test harness entry |
 | `tests/test_detector.cpp` | Detector tests across all supported formats |
 | `tests/test_engine_select.cpp` | Backend routing tests |
@@ -391,6 +414,7 @@ tok/s M1 baseline). Failures always upload full stage logs as artifacts.
 | `.github/workflows/ci.yml` | Four-job CI with hardware build gates, real-generation smokes, and calibrated tempo gates |
 | `scripts/smoke_gguf.ps1` / `smoke_gguf.sh` | Real GGUF generation smokes (Windows CI, macOS Metal) |
 | `scripts/smoke_mlx.sh` | Real MLX weights generation smoke (macOS CI) |
+| `scripts/verify_native_gguf.ps1` / `verify_native_gguf.sh` | Native tensor-index verification across local GGUF files |
 | `scripts/verify_release.ps1` | Release-gate suite: 15 robustness/determinism/server/soak/concurrency checks |
 | `scripts/bench_hf.py` | HuggingFace Transformers reference benchmarks for head-to-head comparisons |
 | `scripts/bench_matrix.py` | Multi-model bench matrix driver |

@@ -60,7 +60,14 @@ PRESTO_TEST(detect_gguf_file) {
   write_bytes(p, minimal_gguf_v3());
   const Detection d = detect_format(p.string());
   PRESTO_EXPECT(d.format == presto::ModelFormat::GGUF);
+  if (d.format != presto::ModelFormat::GGUF) {
+    std::fprintf(stderr, "  GGUF detection error: %s\n", d.summary.c_str());
+    return;
+  }
   PRESTO_EXPECT(d.meta.at("gguf_version") == "3");
+  PRESTO_EXPECT(d.meta.at("tensor_data_offset") == "32");
+  PRESTO_EXPECT(d.meta.at("tensor_bytes") == "0");
+  PRESTO_EXPECT(d.meta.at("tensor_types") == "(none)");
   std::filesystem::remove_all(dir);
 }
 
